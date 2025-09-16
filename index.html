@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>多家具 3D 展示空間</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b1020;color:#e9edf5;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+    #root{display:flex;height:100%}
+    .side{width:300px;background:#0d1430;border-right:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column}
+    .head{padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08);font-weight:700}
+    .section{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .section h4{margin:0 0 8px 0;font-size:13px;color:#9bd1ff}
+    .assets button,.actions button,.materials button{display:inline-block;margin:4px 4px 0 0;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);color:#e9edf5;cursor:pointer;font-weight:600}
+    .materials button{width:32px;height:32px;padding:0;border-radius:8px;border:none}
+    .materials .chip{width:28px;height:28px;border-radius:6px;border:1px solid rgba(255,255,255,.25);display:inline-block}
+    .main{flex:1;position:relative}
+    #app{position:absolute;inset:0}
+    .hud{position:absolute;left:12px;top:12px;padding:8px 10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:10px;backdrop-filter:blur(6px);font-size:12px;line-height:1.4}
+    .status{position:absolute;right:12px;top:12px;padding:8px 10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:10px;font-size:12px}
+    .footer{padding:8px 14px;font-size:12px;opacity:.8}
+    input[type="file"]{display:block;margin-top:8px}
+  </style>
+</head>
+<body>
+<div id="root">
+  <div class="side">
+    <div class="head">家具清單 / 工具</div>
+
+    <div class="section assets">
+      <h4>內建家具</h4>
+      <button data-asset="./furniture.glb">家具 A</button>
+      <h4 style="margin-top:10px">匯入 GLB</h4>
+      <input id="fileInput" type="file" accept=".glb" />
+    </div>
+
+    <div class="section actions">
+      <h4>操作</h4>
+      <button id="btnTranslate">T 移動</button>
+      <button id="btnRotate">R 旋轉</button>
+      <button id="btnScale">Y 縮放</button>
+      <button id="btnDuplicate">複製</button>
+      <button id="btnDelete">刪除</button>
+      <button id="btnDeselect">取消選取</button>
+    </div>
+
+    <div class="section materials">
+      <h4>材質/顏色（套用到選取模型）</h4>
+      <button class="mat" data-color="#ffffff" title="白"><span class="chip" style="background:#ffffff"></span></button>
+      <button class="mat" data-color="#d32f2f" title="紅"><span class="chip" style="background:#d32f2f"></span></button>
+      <button class="mat" data-color="#1976d2" title="藍"><span class="chip" style="background:#1976d2"></span></button>
+      <button class="mat" data-color="#388e3c" title="綠"><span class="chip" style="background:#388e3c"></span></button>
+      <button class="mat" data-color="#795548" title="木"><span class="chip" style="background:#795548"></span></button>
+      <button id="btnResetMat">還原材質</button>
+    </div>
+
+    <div class="section">
+      <h4>量尺</h4>
+      <button id="btnMeasure">切換量測模式</button>
+      <div style="font-size:12px;opacity:.8;margin-top:6px">在地面點兩下，顯示距離（單位≈公尺）</div>
+    </div>
+
+    <div class="section">
+      <h4>場景存取</h4>
+      <button id="btnSave">匯出佈置 JSON</button>
+      <input id="layoutInput" type="file" accept=".json" />
+    </div>
+
+    <div class="footer">提示：點物件選取；快捷鍵 T/R/Y 切換移動/旋轉/縮放，Esc 取消選取。</div>
+  </div>
+
+  <div class="main">
+    <div id="app"></div>
+    <div class="hud">滑鼠左鍵旋轉、右鍵平移、滾輪縮放。點擊家具以選取拖拉擺放（Y 軸固定）。</div>
+    <div class="status" id="status">未選取</div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+import { TransformControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/TransformControls.js';
+
+const app = document.getElementById('app');
+const statusEl = document.getElementById('status');
+
+// Scene
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+
+// Camera
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 300);
+camera.position.set(5, 3, 6);
+
+// Renderer
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+app.appendChild(renderer.domElement);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.6, 0);
+controls.enableDamping = true;
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xffffff, 0x334466, 0.5);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(4, 8, 2);
+dir.castShadow = true;
+dir.shadow.mapSize.set(2048,2048);
+scene.add(dir);
+
+// Room
+const roomSize = 14;
+const roomGeo = new THREE.BoxGeometry(roomSize, roomSize, roomSize);
+const roomMat = new THREE.MeshStandardMaterial({ color: 0x121a38, side: THREE.BackSide, roughness: 1.0 });
+const room = new THREE.Mesh(roomGeo, roomMat);
+room.position.y = roomSize/2;
+room.receiveShadow = true;
+scene.add(room);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(40, 40);
+const groundMat = new THREE.ShadowMaterial({ opacity: 0.25 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid
+const grid = new THREE.GridHelper(40, 40, 0x3a4a6a, 0x1d2940);
+grid.position.y = 0.001;
+scene.add(grid);
+
+// Loaders & helpers
+const loader = new GLTFLoader();
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let selected = null;
+const originalMaterials = new WeakMap();
+
+// Transform controls (XZ move lock)
+const tControls = new TransformControls(camera, renderer.domElement);
+tControls.addEventListener('dragging-changed', e => controls.enabled = !e.value);
+tControls.addEventListener('objectChange', () => {
+  if (tControls.mode === 'translate' && selected) {
+    selected.position.y = 0; // keep on ground
+  }
+});
+scene.add(tControls);
+
+// Selection
+function pickTopGroup(obj){
+  while (obj && obj.parent && !obj.parent.isScene) obj = obj.parent;
+  return obj;
+}
+function setSelected(obj){
+  selected = obj;
+  if (selected) {
+    tControls.attach(selected);
+    statusEl.textContent = '選取：' + (selected.name || selected.uuid);
+  } else {
+    tControls.detach();
+    statusEl.textContent = '未選取';
+  }
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(scene.children, true).filter(i => i.object.isMesh);
+  if (intersects.length){
+    setSelected(pickTopGroup(intersects[0].object));
+  } else {
+    setSelected(null);
+  }
+});
+
+// Keyboard shortcuts
+window.addEventListener('keydown', (e) => {
+  switch (e.key.toLowerCase()) {
+    case 't': tControls.setMode('translate'); break;
+    case 'r': tControls.setMode('rotate'); break;
+    case 'y': tControls.setMode('scale'); break;
+    case 'escape': setSelected(null); break;
+  }
+});
+
+// Asset adding
+function addModelFromUrl(url, name='家具'){
+  loader.load(url, (gltf) => {
+    const g = gltf.scene;
+    g.name = name + '_' + (Math.random()*1e6|0);
+    g.traverse(o => { if (o.isMesh){ o.castShadow = true; o.receiveShadow = true; } });
+    g.position.set(0,0,0);
+    g.scale.set(1,1,1);
+    scene.add(g);
+    setSelected(g);
+  }, undefined, (err)=>console.error(err));
+}
+document.querySelectorAll('.assets button[data-asset]').forEach(btn=>{
+  btn.addEventListener('click', ()=> addModelFromUrl(btn.dataset.asset, btn.textContent.trim()));
+});
+document.getElementById('fileInput').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  addModelFromUrl(url, file.name.replace(/\.glb$/i,''));
+});
+
+// Actions
+document.getElementById('btnTranslate').onclick = ()=> tControls.setMode('translate');
+document.getElementById('btnRotate').onclick = ()=> tControls.setMode('rotate');
+document.getElementById('btnScale').onclick = ()=> tControls.setMode('scale');
+document.getElementById('btnDeselect').onclick = ()=> setSelected(null);
+document.getElementById('btnDelete').onclick = ()=> {
+  if (!selected) return;
+  scene.remove(selected);
+  setSelected(null);
+};
+document.getElementById('btnDuplicate').onclick = ()=> {
+  if (!selected) return;
+  const clone = selected.clone(true);
+  clone.position.x += 0.5;
+  scene.add(clone);
+  setSelected(clone);
+};
+
+// Materials
+function applyColorToSelected(hex){
+  if (!selected) return;
+  selected.traverse(o => {
+    if (o.isMesh) {
+      const mat = o.material;
+      if (!originalMaterials.has(o)) originalMaterials.set(o, mat);
+      if (Array.isArray(mat)){
+        mat.forEach(m => { if (m.color) m.color.set(hex); });
+      } else if (mat && mat.color) {
+        mat.color.set(hex);
+      }
+    }
+  });
+}
+function resetMaterial(){
+  if (!selected) return;
+  selected.traverse(o => {
+    if (o.isMesh && originalMaterials.has(o)) {
+      o.material = originalMaterials.get(o);
+      originalMaterials.delete(o);
+    }
+  });
+}
+document.querySelectorAll('.materials .mat').forEach(btn=>{
+  btn.addEventListener('click', ()=> applyColorToSelected(btn.dataset.color));
+});
+document.getElementById('btnResetMat').onclick = resetMaterial;
+
+// Measure tool
+let measureMode = false;
+let measurePoints = [];
+let measureLine = null;
+const measureBtn = document.getElementById('btnMeasure');
+measureBtn.onclick = ()=>{
+  measureMode = !measureMode;
+  measureBtn.textContent = measureMode ? '量測模式：開' : '量測模式：關';
+  if (!measureMode && measureLine){ scene.remove(measureLine); measureLine = null; measurePoints = []; }
+};
+renderer.domElement.addEventListener('dblclick', (e)=>{
+  if (!measureMode) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const plane = new THREE.Plane(new THREE.Vector3(0,1,0), 0); // ground y=0
+  const pos = new THREE.Vector3();
+  raycaster.ray.intersectPlane(plane, pos);
+  measurePoints.push(pos.clone());
+  if (measurePoints.length === 2) {
+    const [a,b] = measurePoints;
+    const geom = new THREE.BufferGeometry().setFromPoints([a,b]);
+    const mat = new THREE.LineBasicMaterial({ color: 0x9bd1ff });
+    if (measureLine) scene.remove(measureLine);
+    measureLine = new THREE.Line(geom, mat);
+    scene.add(measureLine);
+    const dist = a.distanceTo(b);
+    statusEl.textContent = `量測距離：${dist.toFixed(2)} m`;
+    measurePoints = [];
+  }
+});
+
+// Save / Load layout
+function collectLayout(){
+  const arr = [];
+  scene.children.forEach(o => {
+    if (o.type === 'Group' && o !== room && o !== grid) {
+      arr.push({
+        name: o.name,
+        position: o.position.toArray(),
+        rotation: [o.rotation.x, o.rotation.y, o.rotation.z],
+        scale: o.scale.toArray()
+      });
+    }
+  });
+  return { items: arr };
+}
+document.getElementById('btnSave').onclick = ()=>{
+  const data = JSON.stringify(collectLayout(), null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'layout.json';
+  a.click();
+};
+document.getElementById('layoutInput').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    try {
+      const layout = JSON.parse(reader.result);
+      // Apply to first-level groups (naive mapping by selection order)
+      // Here we just position currently selected, or warn if none.
+      if (!selected) { alert('請先選取要套用位置的物件，再載入 JSON。'); return; }
+      const it = layout.items?.[0];
+      if (!it) { alert('JSON 無 items。'); return; }
+      selected.position.fromArray(it.position);
+      selected.rotation.set(it.rotation[0], it.rotation[1], it.rotation[2]);
+      selected.scale.fromArray(it.scale);
+    } catch(err){ alert('JSON 解析失敗'); }
+  };
+  reader.readAsText(file);
+});
+
+// Resize & render
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+(function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
