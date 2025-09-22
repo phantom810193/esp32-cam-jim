@@ -1,0 +1,49 @@
+{
+  "customers": [
+    {
+      "id": "ID-abc123",
+      "name": "Alice",
+      "favorite_product": "Milk",
+      "embedding": [0.10, 0.20, 0.30, 0.40]
+    },
+    {
+      "id": "ID-def456",
+      "name": "Brian",
+      "favorite_product": "Bread",
+      "embedding": [0.30, 0.10, 0.40, 0.20]
+    },
+    {
+      "id": "ID-ghi789",
+      "name": "Carol",
+      "favorite_product": "Coffee",
+      "embedding": [0.20, 0.30, 0.10, 0.40]
+    }
+  ],
+  "queries": [
+    {
+      "image": "test_face_1.jpg",
+      "expected_id": "ID-abc123",
+      "embedding": [0.11, 0.19, 0.31, 0.39]
+    },
+    {
+      "image": "test_face_2.jpg",
+      "expected_id": "ID-abc123",
+      "embedding": [0.09, 0.22, 0.28, 0.41]
+    },
+    {
+      "image": "test_face_3.jpg",
+      "expected_id": "ID-def456",
+      "embedding": [0.32, 0.12, 0.38, 0.21]
+    },
+    {
+      "image": "test_face_4.jpg",
+      "expected_id": "ID-def456",
+      "embedding": [0.28, 0.11, 0.42, 0.18]
+    },
+    {
+      "image": "test_face_5.jpg",
+      "expected_id": "ID-ghi789",
+      "embedding": [0.21, 0.31, 0.12, 0.39]
+    }
+  ]
+}
