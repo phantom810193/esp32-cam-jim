@@ -11,17 +11,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # === Secrets / Variables you already set ===
-      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-      FIRESTORE_COLLECTION: ${{ secrets.FIRESTORE_COLLECTION || 'visitors' }}
-      FIRESTORE_EVENTS_COLLECTION: ${{ secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
-      FIRESTORE_DATABASE_ID: ${{ secrets.FIRESTORE_DATABASE_ID || '(default)' }}
-      CLOUD_RUN_URL: ${{ secrets.CLOUD_RUN_URL }}
-      CLOUD_RUN_HEALTH_PATH: ${{ secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
-      CLOUD_RUN_DETECT_PATH: ${{ secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
-      ESP32_IMAGE_URL: ${{ secrets.ESP32_IMAGE_URL }}
-      ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '0' }}        # 設 1 會裝 dlib/opencv 並跑 id_batch_test / post_detect_latency
-      ALLOW_CLOUDRUN_FAILURE: ${{ vars.ALLOW_CLOUDRUN_FAILURE || '0' }}
+      # ---- non-secret config: prefer Variables, fallback Secrets/defaults ----
+      GCP_PROJECT: ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
+      CLOUD_RUN_URL: ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
+      CLOUD_RUN_HEALTH_PATH: ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
+      CLOUD_RUN_DETECT_PATH: ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
+      FIRESTORE_COLLECTION: ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'visitors' }}
+      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
+      FIRESTORE_DATABASE_ID: ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
+
+      # ---- embedding / batch 測試可調參數（都建議放 Variables）----
+      ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '1' }}
+      SAMPLES_DIR: ${{ vars.SAMPLES_DIR || 'samples/faces/personA' }}
+      N_IMAGES: ${{ vars.N_IMAGES || '0' }}                  # 0=全部
+      THRESHOLD: ${{ vars.THRESHOLD || '0.8' }}              # 單張門檻
+      TARGET_ACC: ${{ vars.TARGET_ACC || '0.8' }}            # 整體門檻
+      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || '-1' }}     # -1=自動找，或 0/1/2…
+      USE_VISION: ${{ vars.USE_VISION || '1' }}              # 1=先用 Vision 裁臉，0=不裁
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,9 +40,9 @@ jobs:
           if [ -z "$GCP_SA_KEY" ]; then
             echo "❌ Missing secret GCP_SA_KEY" >&2; exit 1
           fi
-          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
+          printf '%s' "$GCP_SA_KEY' > "$RUNNER_TEMP/gcp-key.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
-          echo "✅ SA key written to $RUNNER_TEMP/gcp-key.json"
+          echo "✅ SA key written"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -56,23 +63,17 @@ jobs:
           sudo apt-get install -y build-essential cmake libgl1
           pip install pillow opencv-python dlib==19.24.4 face_recognition scikit-learn
 
-      - name: Init SQLite if present (optional)
-        if: ${{ hashFiles('db/init_db.py') != '' }}
-        run: python db/init_db.py
-
       - name: Connectivity tests (Vision / Firestore / Cloud Run)
         if: ${{ hashFiles('scripts/gcp_connect_test.py') != '' }}
         run: python scripts/gcp_connect_test.py
 
-      # === 你要新增的兩個步驟（在這裡） ===
-      - name: ID batch test (5 images via Vision+embedding)
+      - name: ID batch test (5+ images via Vision+embedding)
         if: ${{ env.ENABLE_EMBEDDING == '1' && hashFiles('scripts/id_batch_test.py') != '' }}
         run: python scripts/id_batch_test.py
 
       - name: API latency test (/detect_face)
         if: ${{ env.ENABLE_EMBEDDING == '1' && hashFiles('scripts/post_detect_latency.py') != '' }}
         run: python scripts/post_detect_latency.py
-      # ========================================
 
       - name: Fallback copy (ensure id_test.log exists)
         shell: bash
