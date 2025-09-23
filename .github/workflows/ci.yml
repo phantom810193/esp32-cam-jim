@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: ['**']
-  pull_request:
+  pull_request: {}
   workflow_dispatch: {}
 
 jobs:
@@ -19,7 +19,6 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -27,13 +26,15 @@ jobs:
           else
             echo "No requirements.txt found; skipping."
           fi
+          # 確保有 pytest，避免 "pytest: command not found"
+          python -m pip install pytest
 
       - name: Run pytest
         run: pytest --maxfail=1 --disable-warnings -q
 
   gcp-tests:
-    # 沒有服務帳戶金鑰就整個 job 跳過（workflow 仍成功）
-    if: ${{ secrets.GCP_SA_KEY != '' }}
+    # 若沒有服務帳戶金鑰則整個 job 跳過（workflow 仍成功）
+    if: ${{ secrets.GCP_SA_KEY }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -48,7 +49,7 @@ jobs:
       FIRESTORE_DATABASE_ID:       ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
 
       # ---------- 嵌入/批次測試旗標 ----------
-      RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING != '' && vars.ENABLE_EMBEDDING) || (secrets.ENABLE_EMBEDDING != '' && secrets.ENABLE_EMBEDDING) || '0' }}
+      RUN_EMBED_TESTS: ${{ vars.ENABLE_EMBEDDING || secrets.ENABLE_EMBEDDING || '0' }}
 
       # ---------- 其他可調參數 ----------
       SAMPLES_DIR:    ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
@@ -62,7 +63,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Print resolved flags
-        shell: bash
         run: |
           echo "RUN_EMBED_TESTS=$RUN_EMBED_TESTS"
           echo "USE_VISION=$USE_VISION  N_IMAGES=$N_IMAGES  BASELINE_INDEX=$BASELINE_INDEX  THRESHOLD=$THRESHOLD  TARGET_ACC=$TARGET_ACC"
@@ -70,11 +70,10 @@ jobs:
       - name: Write GCP service account key
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        shell: bash
         run: |
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
           python - <<'PY'
-import json, os, sys
+import json, os
 p = os.environ["RUNNER_TEMP"] + "/gcp-key.json"
 json.load(open(p))
 print("✅ SA JSON OK:", p)
@@ -87,21 +86,18 @@ PY
           python-version: '3.11'
 
       - name: Install base deps (Vision/Firestore/Auth/HTTP/Numpy)
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
 
       - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
         if: ${{ env.RUN_EMBED_TESTS == '1' }}
-        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libgl1
           pip install pillow opencv-python "dlib==19.24.4" face_recognition face_recognition_models scikit-learn
 
       - name: Install project requirements if present
-        shell: bash
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -120,7 +116,6 @@ PY
         run: python scripts/post_detect_latency.py
 
       - name: Fallback copy (ensure id_test.log exists)
-        shell: bash
         run: |
           if [ -f integrated_test.log ] && [ ! -f id_test.log ]; then
             cp integrated_test.log id_test.log
