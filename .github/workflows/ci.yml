@@ -10,39 +10,56 @@ jobs:
   gcp-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # ---- non-secret config: prefer Variables, fallback Secrets/defaults ----
-      GCP_PROJECT: ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
-      CLOUD_RUN_URL: ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
-      CLOUD_RUN_HEALTH_PATH: ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
-      CLOUD_RUN_DETECT_PATH: ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
-      FIRESTORE_COLLECTION: ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'visitors' }}
-      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
-      FIRESTORE_DATABASE_ID: ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
 
-      # ---- embedding / batch 測試可調參數（都建議放 Variables）----
+    env:
+      # ---- prefer Variables; fallback Secrets/defaults ----
+      GCP_PROJECT:               ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
+      CLOUD_RUN_URL:             ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
+      CLOUD_RUN_HEALTH_PATH:     ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
+      CLOUD_RUN_DETECT_PATH:     ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
+      FIRESTORE_COLLECTION:      ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'visitors' }}
+      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
+      FIRESTORE_DATABASE_ID:     ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
+
+      # ---- embedding / batch 測試參數（建議放 Variables）----
       ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '1' }}
-      SAMPLES_DIR: ${{ vars.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES: ${{ vars.N_IMAGES || '0' }}                  # 0=全部
-      THRESHOLD: ${{ vars.THRESHOLD || '0.8' }}              # 單張門檻
-      TARGET_ACC: ${{ vars.TARGET_ACC || '0.8' }}            # 整體門檻
-      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || '-1' }}     # -1=自動找，或 0/1/2…
-      USE_VISION: ${{ vars.USE_VISION || '1' }}              # 1=先用 Vision 裁臉，0=不裁
+      SAMPLES_DIR:      ${{ vars.SAMPLES_DIR || 'samples/faces/personA' }}
+      N_IMAGES:         ${{ vars.N_IMAGES || '0' }}           # 0 = 全部
+      THRESHOLD:        ${{ vars.THRESHOLD || '0.8' }}        # 單張門檻
+      TARGET_ACC:       ${{ vars.TARGET_ACC || '0.8' }}       # 整體門檻
+      BASELINE_INDEX:   ${{ vars.BASELINE_INDEX || '-1' }}    # -1 自動挑; 或 0/1/2…
+      USE_VISION:       ${{ vars.USE_VISION || '1' }}         # 1 先用 Vision 裁臉
 
     steps:
       - uses: actions/checkout@v4
 
+      # === 寫入 GCP 服務帳戶金鑰（修正引號 + 驗證 JSON） ===
       - name: Write GCP service account key
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         shell: bash
         run: |
           if [ -z "$GCP_SA_KEY" ]; then
-            echo "❌ Missing secret GCP_SA_KEY" >&2; exit 1
+            echo "❌ Missing secret GCP_SA_KEY" >&2
+            exit 1
           fi
-          printf '%s' "$GCP_SA_KEY' > "$RUNNER_TEMP/gcp-key.json"
+
+          # 正確寫入原始 JSON（修正：結尾引號）
+          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
+
+          # 驗證 JSON 格式
+          python - <<'PY'
+import json, os, sys
+p = os.environ["RUNNER_TEMP"] + "/gcp-key.json"
+try:
+    json.load(open(p))
+    print("✅ Valid service account JSON at:", p)
+except Exception as e:
+    print("❌ Invalid JSON:", e, file=sys.stderr); sys.exit(1)
+PY
+
+          # 匯出給後續步驟使用
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
-          echo "✅ SA key written"
 
       - name: Setup Python
         uses: actions/setup-python@v5
