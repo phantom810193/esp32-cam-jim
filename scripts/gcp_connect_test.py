@@ -18,20 +18,20 @@ def test_vision():
         img_bytes = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2x0nQAAAAASUVORK5CYII=')
     t0 = time.time()
     client = vision.ImageAnnotatorClient()
-    resp = client.face_detection(image=vision.Image(content=img_bytes))
+    _ = client.face_detection(image=vision.Image(content=img_bytes))
     ms = round((time.time()-t0)*1000)
-    faces = len(resp.face_annotations or [])
-    log_to('vision_test.log', f"ok latency_ms={ms} faces={faces}")
+    log_to('vision_test.log', f"ok latency_ms={ms}")
     return True
 
 def test_firestore():
     from google.cloud import firestore
     proj = os.environ.get('GCP_PROJECT')
     col = os.environ.get('FIRESTORE_COLLECTION', 'visitors')
+    dbid = os.environ.get('FIRESTORE_DATABASE_ID', '(default)')
     if not proj:
         log_to('firestore_test.log', "missing GCP_PROJECT")
         return False
-    db = firestore.Client(project=proj)
+    db = firestore.Client(project=proj, database=dbid)
     doc_id = f"ci-{int(time.time())}"
     t0 = time.time()
     db.collection(col).document(doc_id).set({
@@ -40,7 +40,7 @@ def test_firestore():
         'note': 'connectivity-test'
     })
     ms = round((time.time()-t0)*1000)
-    log_to('firestore_test.log', f"ok project={proj} collection={col} doc={doc_id} latency_ms={ms}")
+    log_to('firestore_test.log', f"ok project={proj} database={dbid} collection={col} doc={doc_id} latency_ms={ms}")
     return True
 
 def test_cloud_run():
@@ -49,18 +49,18 @@ def test_cloud_run():
     if not url:
         log_to('cloudrun_test.log', "skipped (set CLOUD_RUN_URL to enable)")
         return True
-    path = os.environ.get('CLOUD_RUN_HEALTH_PATH', '/healthz')
-
-    # 先試未驗證；401/403 再自動帶 ID Token
+    path = os.environ.get('CLOUD_RUN_HEALTH_PATH', '/')
+    # 先試未驗證；401/403 則帶 ID Token 再試
     t0 = time.time()
     r = requests.get(url + path, timeout=10)
     ms = round((time.time()-t0)*1000)
-    if r.status_code in (401,403):
+    if r.status_code in (401, 403):
         try:
             from google.oauth2 import service_account
             from google.auth.transport.requests import AuthorizedSession
             creds = service_account.IDTokenCredentials.from_service_account_file(
-                os.environ['GOOGLE_APPLICATION_CREDENTIALS'], target_audience=url
+                os.environ['GOOGLE_APPLICATION_CREDENTIALS'],
+                target_audience=url
             )
             authed = AuthorizedSession(creds)
             t0 = time.time()
