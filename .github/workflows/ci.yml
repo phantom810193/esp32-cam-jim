@@ -12,45 +12,47 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # ---- prefer Variables; fallback Secrets/defaults ----
+      # ---------- 常規設定（先讀 Variables，沒有再讀 Secrets，最後給預設） ----------
       GCP_PROJECT:               ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
       CLOUD_RUN_URL:             ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
       CLOUD_RUN_HEALTH_PATH:     ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
       CLOUD_RUN_DETECT_PATH:     ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
-      FIRESTORE_COLLECTION:      ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'visitors' }}
-      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
+      FIRESTORE_COLLECTION:      ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
+      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'visits' }}
       FIRESTORE_DATABASE_ID:     ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
 
-      # ---- embedding / batch 測試參數（建議放 Variables）----
-      ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '1' }}
-      SAMPLES_DIR:      ${{ vars.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES:         ${{ vars.N_IMAGES || '0' }}           # 0=全部
-      THRESHOLD:        ${{ vars.THRESHOLD || '0.8' }}        # 單張門檻
-      TARGET_ACC:       ${{ vars.TARGET_ACC || '0.8' }}       # 整體門檻
-      BASELINE_INDEX:   ${{ vars.BASELINE_INDEX || '-1' }}    # -1 自動挑; 或 0/1/2…
-      USE_VISION:       ${{ vars.USE_VISION || '1' }}         # 1=先用 Vision 裁臉
+      # ---------- 嵌入/批次測試旗標：Variables 優先，否則讀 Secrets，否則預設 0 ----------
+      RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING != '' && vars.ENABLE_EMBEDDING) || (secrets.ENABLE_EMBEDDING != '' && secrets.ENABLE_EMBEDDING) || '0' }}
+
+      # 其他可調參數（都走 Variables → Secrets → 預設）
+      SAMPLES_DIR:      ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
+      N_IMAGES:         ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}           # 0 = 全部
+      THRESHOLD:        ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
+      TARGET_ACC:       ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
+      BASELINE_INDEX:   ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}  # -1 自動找
+      USE_VISION:       ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # === 寫入 GCP 服務帳戶金鑰（修正引號 + 一行驗證 JSON） ===
+      # 顯示最終生效的旗標，方便除錯
+      - name: Print resolved flags
+        shell: bash
+        run: |
+          echo "RUN_EMBED_TESTS=$RUN_EMBED_TESTS"
+          echo "USE_VISION=$USE_VISION  N_IMAGES=$N_IMAGES  BASELINE_INDEX=$BASELINE_INDEX  THRESHOLD=$THRESHOLD  TARGET_ACC=$TARGET_ACC"
+
       - name: Write GCP service account key
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         shell: bash
         run: |
           if [ -z "$GCP_SA_KEY" ]; then
-            echo "❌ Missing secret GCP_SA_KEY" >&2
-            exit 1
+            echo "❌ Missing secret GCP_SA_KEY" >&2; exit 1
           fi
-
-          # 1) 寫入原始 JSON（注意：這裡要的是『完整 JSON 內容』，不要 base64）
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
-
-          # 2) 驗證 JSON 格式（避免貼錯）
-          python -c "import json,os,sys; p=os.environ['RUNNER_TEMP']+'/gcp-key.json'; json.load(open(p)); print('Valid service account JSON at:', p)" || exit 1
-
-          # 3) 匯出給後續步驟使用
+          # 驗證 JSON
+          python -c "import json,os; json.load(open(os.environ['RUNNER_TEMP']+'/gcp-key.json')); print('✅ SA JSON OK')"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
 
       - name: Setup Python
@@ -64,24 +66,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
 
+      # 嵌入依賴只在 RUN_EMBED_TESTS=1 才安裝
       - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
-        if: ${{ env.ENABLE_EMBEDDING == '1' }}
+        if: ${{ env.RUN_EMBED_TESTS == '1' }}
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libgl1
-          pip install pillow opencv-python dlib==19.24.4 face_recognition scikit-learn
+          pip install pillow opencv-python dlib==19.24.4 face_recognition face_recognition_models scikit-learn
 
       - name: Connectivity tests (Vision / Firestore / Cloud Run)
         if: ${{ hashFiles('scripts/gcp_connect_test.py') != '' }}
         run: python scripts/gcp_connect_test.py
 
-      - name: ID batch test (5+ images via Vision+embedding)
-        if: ${{ env.ENABLE_EMBEDDING == '1' && hashFiles('scripts/id_batch_test.py') != '' }}
+      - name: ID batch test (Vision+embedding)
+        if: ${{ env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/id_batch_test.py') != '' }}
         run: python scripts/id_batch_test.py
 
       - name: API latency test (/detect_face)
-        if: ${{ env.ENABLE_EMBEDDING == '1' && hashFiles('scripts/post_detect_latency.py') != '' }}
+        if: ${{ env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/post_detect_latency.py') != '' }}
         run: python scripts/post_detect_latency.py
 
       - name: Fallback copy (ensure id_test.log exists)
@@ -104,5 +107,4 @@ jobs:
             integrated_test.log
             id_test.log
             api_test.log
-            debug/**
           if-no-files-found: warn
