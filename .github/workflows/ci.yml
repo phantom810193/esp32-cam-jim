@@ -24,16 +24,16 @@ jobs:
       # ---- embedding / batch 測試參數（建議放 Variables）----
       ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '1' }}
       SAMPLES_DIR:      ${{ vars.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES:         ${{ vars.N_IMAGES || '0' }}           # 0 = 全部
+      N_IMAGES:         ${{ vars.N_IMAGES || '0' }}           # 0=全部
       THRESHOLD:        ${{ vars.THRESHOLD || '0.8' }}        # 單張門檻
       TARGET_ACC:       ${{ vars.TARGET_ACC || '0.8' }}       # 整體門檻
       BASELINE_INDEX:   ${{ vars.BASELINE_INDEX || '-1' }}    # -1 自動挑; 或 0/1/2…
-      USE_VISION:       ${{ vars.USE_VISION || '1' }}         # 1 先用 Vision 裁臉
+      USE_VISION:       ${{ vars.USE_VISION || '1' }}         # 1=先用 Vision 裁臉
 
     steps:
       - uses: actions/checkout@v4
 
-      # === 寫入 GCP 服務帳戶金鑰（修正引號 + 驗證 JSON） ===
+      # === 寫入 GCP 服務帳戶金鑰（修正引號 + 一行驗證 JSON） ===
       - name: Write GCP service account key
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -44,21 +44,13 @@ jobs:
             exit 1
           fi
 
-          # 正確寫入原始 JSON（修正：結尾引號）
+          # 1) 寫入原始 JSON（注意：這裡要的是『完整 JSON 內容』，不要 base64）
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
 
-          # 驗證 JSON 格式
-          python - <<'PY'
-import json, os, sys
-p = os.environ["RUNNER_TEMP"] + "/gcp-key.json"
-try:
-    json.load(open(p))
-    print("✅ Valid service account JSON at:", p)
-except Exception as e:
-    print("❌ Invalid JSON:", e, file=sys.stderr); sys.exit(1)
-PY
+          # 2) 驗證 JSON 格式（避免貼錯）
+          python -c "import json,os,sys; p=os.environ['RUNNER_TEMP']+'/gcp-key.json'; json.load(open(p)); print('Valid service account JSON at:', p)" || exit 1
 
-          # 匯出給後續步驟使用
+          # 3) 匯出給後續步驟使用
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
 
       - name: Setup Python
