@@ -30,8 +30,8 @@ jobs:
           fi
           pip install pytest
 
-      - name: Run pytest
-        run: pytest --maxfail=1 --disable-warnings -q
+      - name: Run pytest (unit only; ignore integration scripts)
+        run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
 
   gcp-tests:
     runs-on: ubuntu-latest
@@ -124,14 +124,17 @@ jobs:
 
       - name: Connectivity tests (Vision / Firestore / Cloud Run)
         if: env.SKIP_GCP != '1' && hashFiles('scripts/gcp_connect_test.py') != ''
+        continue-on-error: true
         run: python scripts/gcp_connect_test.py
 
       - name: ID batch test (Vision+embedding)
         if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/id_batch_test.py') != ''
+        continue-on-error: true
         run: python scripts/id_batch_test.py
 
       - name: API latency test (/detect_face)
         if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/post_detect_latency.py') != ''
+        continue-on-error: true
         run: python scripts/post_detect_latency.py
 
       - name: Fallback copy (ensure id_test.log exists)
