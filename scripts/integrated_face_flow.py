@@ -10,7 +10,8 @@ ESP32_IMAGE_URL = os.environ.get('ESP32_IMAGE_URL', '')
 CLOUD_RUN_URL = (os.environ.get('CLOUD_RUN_URL') or '').rstrip('/')
 DETECT_PATH = os.environ.get('CLOUD_RUN_DETECT_PATH')  # e.g. /detect_face
 
-def log(msg): print(msg); logging.info(msg)
+def log(msg): 
+    print(msg); logging.info(msg)
 
 def fetch_frame_bytes():
     import requests
@@ -26,12 +27,14 @@ def crop_face_by_vision(img_bytes: bytes):
     from PIL import Image
     client = vision.ImageAnnotatorClient()
     res = client.face_detection(image=vision.Image(content=img_bytes))
-    if not res.face_annotations: return img_bytes
+    if not res.face_annotations: 
+        return img_bytes
     vs = res.face_annotations[0].bounding_poly.vertices
     im = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     xs=[v.x for v in vs]; ys=[v.y for v in vs]
     x1,y1,x2,y2 = max(min(xs),0), max(min(ys),0), min(max(xs), im.width), min(max(ys), im.height)
-    if x2<=x1 or y2<=y1: return img_bytes
+    if x2<=x1 or y2<=y1: 
+        return img_bytes
     bio = io.BytesIO(); im.crop((x1,y1,x2,y2)).save(bio, format='JPEG', quality=92)
     return bio.getvalue()
 
@@ -54,8 +57,8 @@ def write_event(db, kind, payload):
 def post_cloud_run_detect(frame: bytes):
     import requests
     url = CLOUD_RUN_URL; path = DETECT_PATH or ''
-    if not url or not path: return
-    # 未驗證先試；401/403 就自動帶 ID Token
+    if not url or not path: 
+        return
     files={'file': ('frame.jpg', io.BytesIO(frame), 'image/jpeg')}
     r = requests.post(url + path, files=files, timeout=15)
     if r.status_code in (401,403):
@@ -73,16 +76,24 @@ def main():
     frame = fetch_frame_bytes()
     face_crop = crop_face_by_vision(frame)
     enc = embed_face(face_crop)
+
     if enc is None:
+        # 這裡要帶上 database id
         from google.cloud import firestore
-        db = firestore.Client(project=GCP_PROJECT)
+        db = firestore.Client(
+            project=GCP_PROJECT,
+            database=os.environ.get('FIRESTORE_DATABASE_ID','(default)')
+        )
         write_event(db, 'no_face', {'note': 'no embedding'})
-        log("no-embedding-from-image"); return 0
+        log("no-embedding-from-image")
+        return 0
 
     from firestore_embedding_utils import get_db, ensure_enrolled, load_embed
     db = get_db(GCP_PROJECT)
+
     enrolled = ensure_enrolled(db, COL, 'personA', enc)
-    if enrolled: log("enrolled baseline personA")
+    if enrolled: 
+        log("enrolled baseline personA")
 
     ref = load_embed(db, COL, 'personA')
     sim = cos_sim(ref, enc) if ref is not None else 0.0
