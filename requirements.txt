@@ -1,14 +1,14 @@
 Flask==3.0.3
-gunicorn==21.2.0         # Cloud Run 上用 gunicorn 啟動最穩
-requests>=2.32.0         # 打 Cloud Run/ESP32/外部嵌入服務的 HTTP
+gunicorn==21.2.0          # Cloud Run 上用 gunicorn 啟動
+requests>=2.32.0          # 呼叫 Cloud Run/ESP32/外部服務
 
 # 若 FaceRecognitionService 會用到 GCP：
 google-auth[requests]>=2.29.0
 google-cloud-vision>=3.10.0
 google-cloud-firestore>=2.14.0
 
-# 常見向量/圖片處理（若 service 內有用到）
-numpy>=1.26.4
+# 向量/圖片處理（若 service 內用到）
+numpy>=1.26.4,<3
 Pillow>=10.3.0
 
 # 測試

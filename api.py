@@ -6,7 +6,7 @@ import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, request
@@ -15,6 +15,7 @@ from database_utils import (
     connect,
     create_user_record,
     fetch_all_users,
+    fetch_recent_visits,
     get_user,
     initialize_database,
     record_visit,
@@ -51,11 +52,10 @@ def _gather_embeddings_from_payload(
 ) -> List[List[float]]:
     """
     從請求內容組出 embeddings：
-      1) payload['embeddings']：直接使用（最佳）
+      1) payload['embeddings']：直接使用
       2) payload['embedding']：單一向量
       3) payload['images'] (base64 array) 或 payload['urls']：嘗試轉圖片→向量
-         * 僅當 FaceRecognitionService 有提供「bytes -> embedding」能力時才會成功
-          （會嘗試呼叫 embed_bytes / embedding_from_bytes / embed_image / embed）
+         * 僅當 FaceRecognitionService 有提供 bytes→embedding 能力時才會成功
     """
     embs: List[List[float]] = []
 
@@ -63,13 +63,13 @@ def _gather_embeddings_from_payload(
     if isinstance(payload.get("embeddings"), list) and payload["embeddings"]:
         for e in payload["embeddings"]:
             if isinstance(e, list) and e:
-                embs.append(e)
+                embs.append([float(x) for x in e])
         if embs:
             return embs
 
     # 2) 單筆向量
     if isinstance(payload.get("embedding"), list) and payload["embedding"]:
-        return [payload["embedding"]]
+        return [[float(x) for x in payload["embedding"]]]
 
     # 3) 圖片（base64 或 URL）
     images: List[bytes] = []
@@ -100,7 +100,7 @@ def _gather_embeddings_from_payload(
 
         for img in images:
             try:
-                e = embed_fn(img)  # type: ignore[call-arg]
+                e = embed_fn(img)  # type: ignore[misc]
                 if isinstance(e, (list, tuple)) and e and isinstance(e[0], (float, int)):
                     embs.append([float(x) for x in e])
             except Exception:
@@ -127,121 +127,172 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
         THRESHOLD=recognition_threshold,
     )
 
-    # DB 初始化
+    # DB 初始化 + 臉辨服務
     initialize_database(db_path, sql_path, reset=config.get("RESET_DB", False))
-    # 臉辨服務
     face_service = FaceRecognitionService(threshold=recognition_threshold)
+
+    def _log_and_response(payload: Dict[str, Any], *, endpoint: str, status_code: int = 200):
+        log_entry = {"endpoint": endpoint, "status": "ok", **payload}
+        _append_json_line(Path(app.config["API_LOG_PATH"]), log_entry)
+        return jsonify(payload), status_code
 
     # -------- health --------
     @app.get("/health")
     def health() -> Any:
         return jsonify({"ok": True, "time": _now_iso()})
 
-    # -------- enroll：首次建檔 --------
+    # -------- enroll：首次建檔（支援 embeddings / images / urls）--------
     @app.post("/enroll")
     def enroll() -> Any:
-        """
-        請求格式（任一種即可）：
-          - JSON: {"embeddings":[[...],[...]], "purchase":"Milk", "timestamp":"..."}
-          - JSON: {"images":[<base64>, ...], "purchase":"Milk"}
-          - JSON: {"urls":[<http(s)://...>, ...], "purchase":"Milk"}
-
-        流程：
-          1) 取得1~N筆 embedding
-          2) 使用 face_service.identify_embedding(e) 取得 person_id / 信心值
-          3) 若 DB 無此人 → 建檔、寫一筆消費；若已存在 → 僅寫一次消費（視作完成建檔）
-        """
         start = time.perf_counter()
         payload = request.get_json(force=True) or {}
 
-        # 蒐集 embeddings
-        embeddings = _gather_embeddings_from_payload(payload, face_service)
+        try:
+            embeddings = _gather_embeddings_from_payload(payload, face_service)
+        except Exception as exc:
+            return jsonify({"error": f"invalid payload: {exc}"}), 400
+
         if not embeddings:
             return jsonify({"error": "no embeddings or images/urls to enroll"}), 400
 
         purchase = str(payload.get("purchase") or "Milk")
         timestamp = payload.get("timestamp") or _now_iso()
+        spend = float(payload.get("spend", 100.0))
+        requested_id = payload.get("id")
 
-        person_id: Optional[str] = None
-        confidence_max = 0.0
-        # 取多張中的最好一張（或你也可改成平均/多筆存檔）
+        # 先計算最高信心（給回應用）
+        best_conf = 0.0
         for e in embeddings:
-            pid, conf, _ = face_service.identify_embedding(e)
-            if conf > confidence_max:
-                confidence_max = conf
-                person_id = pid
+            _, conf, _ = face_service.identify_embedding(e)
+            best_conf = max(best_conf, float(conf))
 
-        if person_id is None:
-            return jsonify({"error": "failed to generate person id"}), 500
+        # 若服務支援 enroll，優先使用；否則 fallback 取最高信心者的 id
+        resolved_id: Optional[str] = None
+        n_registered = len(embeddings)
+        if hasattr(face_service, "enroll"):
+            try:
+                enrollment = face_service.enroll(embeddings, user_id=requested_id)  # type: ignore[misc]
+                resolved_id = str(enrollment.get("id"))
+                n_registered = int(enrollment.get("embeddings_count", len(enrollment.get("embeddings", embeddings))))
+            except Exception:
+                resolved_id = None
+
+        if not resolved_id:
+            best_id = None
+            best = -1.0
+            for e in embeddings:
+                pid, conf, _ = face_service.identify_embedding(e)
+                if conf > best:
+                    best = float(conf)
+                    best_id = pid
+            resolved_id = str(best_id) if best_id else None
+
+        if not resolved_id:
+            return jsonify({"error": "failed to resolve user id"}), 500
 
         with connect(app.config["DB_PATH"]) as connection:
-            record = get_user(connection, person_id)
+            record = get_user(connection, resolved_id)
             if record is None:
-                create_user_record(connection, user_id=person_id, created_at=timestamp, purchase=purchase)
-                record_visit(connection, user_id=person_id, visit_time=timestamp, purchase=purchase)
+                create_user_record(
+                    connection,
+                    user_id=resolved_id,
+                    created_at=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="enroll",
+                )
                 message = "新用戶已建檔"
-                promotion = f"首次來店，{purchase} 9折！"
                 is_new = True
+                base_purchase = purchase
             else:
-                # 視為已建檔，寫一筆消費
-                record_visit(connection, user_id=person_id, visit_time=timestamp, purchase=purchase)
-                message = "已存在用戶，新增消費紀錄"
-                promotion = f"上次買{record.last_purchase}，現9折！"
+                record_visit(
+                    connection,
+                    user_id=resolved_id,
+                    visit_time=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="enroll",
+                )
+                message = "使用者已存在，已更新影像"
                 is_new = False
+                base_purchase = record.last_purchase or purchase
 
-        duration_ms = (time.perf_counter() - start) * 1000
+            recent_visits = fetch_recent_visits(connection, user_id=resolved_id, limit=5)
+
+        promotion = f"上次買{base_purchase}，現9折！" if not is_new else f"首次來店，{purchase} 9折！"
+        duration_ms = (time.perf_counter() - start) * 1000.0
+
         resp = {
-            "id": person_id,
-            "confidence": confidence_max,
+            "id": resolved_id,
+            "confidence": best_conf,
             "new_user": is_new,
             "message": message,
             "promotion": promotion,
             "timestamp": timestamp,
             "duration_ms": duration_ms,
-            "n_embeddings": len(embeddings),
+            "embeddings_registered": n_registered,
+            "visit_count": len(recent_visits),
+            "visits": [v.__dict__ for v in recent_visits],
         }
-        _append_json_line(Path(app.config["API_LOG_PATH"]), {"endpoint": "/enroll", "status": "ok", **resp})
-        return jsonify(resp)
+        return _log_and_response(resp, endpoint="/enroll", status_code=201 if is_new else 200)
 
-    # -------- detect_face：返店辨識 --------
+    # -------- detect_face：返店辨識（單一 embedding）--------
     @app.post("/detect_face")
     def detect_face() -> Any:
         start = time.perf_counter()
         payload = request.get_json(force=True) or {}
 
-        # 這個端點假設前端已計算好單一 embedding
         embedding = payload.get("embedding")
         if embedding is None:
             return jsonify({"error": "missing embedding"}), 400
 
         purchase = payload.get("purchase", "Milk")
         timestamp = payload.get("timestamp") or _now_iso()
+        spend = float(payload.get("spend", 100.0))
 
-        person_id, confidence, is_new = face_service.identify_embedding(embedding)
+        person_id, confidence, _ = face_service.identify_embedding(embedding)
         with connect(app.config["DB_PATH"]) as connection:
             record = get_user(connection, person_id)
             if record is None:
-                create_user_record(connection, user_id=person_id, created_at=timestamp, purchase=purchase)
+                create_user_record(
+                    connection,
+                    user_id=person_id,
+                    created_at=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="detect_face",
+                )
                 message = "新用戶已建檔"
                 promotion = f"首次來店，{purchase} 9折！"
                 is_new = True
             else:
-                record_visit(connection, user_id=person_id, visit_time=timestamp, purchase=purchase)
+                record_visit(
+                    connection,
+                    user_id=person_id,
+                    visit_time=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="detect_face",
+                )
                 message = "老朋友歡迎回來"
                 promotion = f"上次買{record.last_purchase}，現9折！"
+                is_new = False
 
-        duration_ms = (time.perf_counter() - start) * 1000
+            recent_visits = fetch_recent_visits(connection, user_id=person_id, limit=5)
+
+        duration_ms = (time.perf_counter() - start) * 1000.0
         resp = {
             "id": person_id,
-            "confidence": confidence,
+            "confidence": float(confidence),
             "new_user": is_new,
             "message": message,
             "promotion": promotion,
             "timestamp": timestamp,
             "duration_ms": duration_ms,
+            "visit_count": len(recent_visits),
+            "visits": [v.__dict__ for v in recent_visits],
         }
-        _append_json_line(Path(app.config["API_LOG_PATH"]), {"endpoint": "/detect_face", "status": "ok", **resp})
-        return jsonify(resp)
+        return _log_and_response(resp, endpoint="/detect_face")
 
     # -------- 管理小工具 --------
     @app.get("/admin/users")
@@ -254,4 +305,5 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
 
 
 app = create_app()
+
 __all__ = ["create_app", "app"]

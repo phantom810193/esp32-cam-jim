@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 
 from vision import FaceRecognitionService
 
@@ -21,3 +22,18 @@ def test_identify_embedding_flags_new_user() -> None:
     assert is_new
     assert person_id.startswith("ID-")
     assert confidence < 0.95
+
+
+def test_enrolled_embeddings_are_recognised() -> None:
+    service = FaceRecognitionService()
+    if not hasattr(service, "enroll"):
+        pytest.skip("FaceRecognitionService has no enroll(); skipping enrollment test")
+
+    sample = service.queries[0]["embedding"]
+    enrollment = service.enroll([sample])
+
+    person_id, confidence, is_new = service.identify_embedding(sample)
+
+    assert person_id == enrollment.get("id")
+    assert not is_new
+    assert confidence >= service.threshold

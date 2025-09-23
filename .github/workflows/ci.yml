@@ -1,4 +1,4 @@
-name: GCP CI
+name: CI
 
 on:
   push:
@@ -7,35 +7,60 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found; skipping."
+          fi
+
+      - name: Run pytest
+        run: pytest --maxfail=1 --disable-warnings -q
+
   gcp-tests:
+    # 沒有服務帳戶金鑰就整個 job 跳過（workflow 仍成功）
+    if: ${{ secrets.GCP_SA_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
-      # ---------- 常規設定（先讀 Variables，沒有再讀 Secrets，最後給預設） ----------
-      GCP_PROJECT:               ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
-      CLOUD_RUN_URL:             ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
-      CLOUD_RUN_HEALTH_PATH:     ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
-      CLOUD_RUN_DETECT_PATH:     ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
-      FIRESTORE_COLLECTION:      ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
+      # ---------- 常規設定（Variables 優先，否則 Secrets，再給預設） ----------
+      GCP_PROJECT:                 ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
+      CLOUD_RUN_URL:               ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
+      CLOUD_RUN_HEALTH_PATH:       ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
+      CLOUD_RUN_DETECT_PATH:       ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
+      FIRESTORE_COLLECTION:        ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
       FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'visits' }}
-      FIRESTORE_DATABASE_ID:     ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
+      FIRESTORE_DATABASE_ID:       ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
 
-      # ---------- 嵌入/批次測試旗標：Variables 優先，否則讀 Secrets，否則預設 0 ----------
+      # ---------- 嵌入/批次測試旗標 ----------
       RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING != '' && vars.ENABLE_EMBEDDING) || (secrets.ENABLE_EMBEDDING != '' && secrets.ENABLE_EMBEDDING) || '0' }}
 
-      # 其他可調參數（都走 Variables → Secrets → 預設）
-      SAMPLES_DIR:      ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES:         ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}           # 0 = 全部
-      THRESHOLD:        ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
-      TARGET_ACC:       ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
-      BASELINE_INDEX:   ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}  # -1 自動找
-      USE_VISION:       ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
+      # ---------- 其他可調參數 ----------
+      SAMPLES_DIR:    ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
+      N_IMAGES:       ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}        # 0 = 全部
+      THRESHOLD:      ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
+      TARGET_ACC:     ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
+      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}  # -1 自動找
+      USE_VISION:     ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # 顯示最終生效的旗標，方便除錯
       - name: Print resolved flags
         shell: bash
         run: |
@@ -47,15 +72,16 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         shell: bash
         run: |
-          if [ -z "$GCP_SA_KEY" ]; then
-            echo "❌ Missing secret GCP_SA_KEY" >&2; exit 1
-          fi
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
-          # 驗證 JSON
-          python -c "import json,os; json.load(open(os.environ['RUNNER_TEMP']+'/gcp-key.json')); print('✅ SA JSON OK')"
+          python - <<'PY'
+import json, os, sys
+p = os.environ["RUNNER_TEMP"] + "/gcp-key.json"
+json.load(open(p))
+print("✅ SA JSON OK:", p)
+PY
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -66,14 +92,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
 
-      # 嵌入依賴只在 RUN_EMBED_TESTS=1 才安裝
       - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
         if: ${{ env.RUN_EMBED_TESTS == '1' }}
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libgl1
-          pip install pillow opencv-python dlib==19.24.4 face_recognition face_recognition_models scikit-learn
+          pip install pillow opencv-python "dlib==19.24.4" face_recognition face_recognition_models scikit-learn
+
+      - name: Install project requirements if present
+        shell: bash
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
       - name: Connectivity tests (Vision / Firestore / Cloud Run)
         if: ${{ hashFiles('scripts/gcp_connect_test.py') != '' }}
