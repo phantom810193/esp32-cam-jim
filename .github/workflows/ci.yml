@@ -14,14 +14,16 @@ jobs:
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       FIRESTORE_COLLECTION: ${{ secrets.FIRESTORE_COLLECTION || 'visitors' }}
       FIRESTORE_EVENTS_COLLECTION: ${{ secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
+      FIRESTORE_DATABASE_ID: ${{ secrets.FIRESTORE_DATABASE_ID || '(default)' }}   # ← 指定你的 DB ID
       CLOUD_RUN_URL: ${{ secrets.CLOUD_RUN_URL }}
-      CLOUD_RUN_HEALTH_PATH: ${{ secrets.CLOUD_RUN_HEALTH_PATH || '/healthz' }}
+      CLOUD_RUN_HEALTH_PATH: ${{ secrets.CLOUD_RUN_HEALTH_PATH || '/' }}          # ← 先用根路徑最穩
       CLOUD_RUN_DETECT_PATH: ${{ secrets.CLOUD_RUN_DETECT_PATH }}
       ESP32_IMAGE_URL: ${{ secrets.ESP32_IMAGE_URL }}
       ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '0' }}  # 設為 1 會安裝 dlib/opencv 並跑整合流程
     steps:
       - uses: actions/checkout@v4
 
+      # 用 env 注入 Secret，避免 *** 遮蔽；POSIX [ ] 相容 sh/bash
       - name: Write GCP service account key
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -40,13 +42,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ✅ 修正這裡：用 google-auth[requests]，不要安裝不存在的 google-auth-transport-requests
+      # 基礎依賴（包含 google-auth 的 requests 外掛）
       - name: Install base deps (Vision/Firestore/Auth/HTTP/Numpy)
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
 
+      # 可選：人臉嵌入需要較重的套件
       - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
         if: ${{ env.ENABLE_EMBEDDING == '1' }}
         shell: bash
@@ -68,6 +71,7 @@ jobs:
         run: python scripts/integrated_face_flow.py
 
       - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gcp-logs
