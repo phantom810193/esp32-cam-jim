@@ -2,9 +2,9 @@ name: GCP CI
 
 on:
   push:
-    branches: ['**']
+    branches: ['**']      # 所有分支都會觸發（含 codex/**）
   pull_request:
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # 允許在 Actions 頁手動執行
 
 jobs:
   gcp-tests:
@@ -13,26 +13,27 @@ jobs:
     env:
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       FIRESTORE_COLLECTION: ${{ secrets.FIRESTORE_COLLECTION || 'visitors' }}
+      FIRESTORE_EVENTS_COLLECTION: ${{ secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
       CLOUD_RUN_URL: ${{ secrets.CLOUD_RUN_URL }}
       CLOUD_RUN_HEALTH_PATH: ${{ secrets.CLOUD_RUN_HEALTH_PATH || '/healthz' }}
       CLOUD_RUN_DETECT_PATH: ${{ secrets.CLOUD_RUN_DETECT_PATH }}
       ESP32_IMAGE_URL: ${{ secrets.ESP32_IMAGE_URL }}
-      # ⚠️ 這裡先不要用 runner.temp，稍後用 step 寫入 GITHUB_ENV
+      ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '0' }}  # 設為 1 會安裝 dlib/opencv 並跑整合流程
     steps:
       - uses: actions/checkout@v4
 
-      # 先把 GOOGLE_APPLICATION_CREDENTIALS 寫到環境變數（用 $RUNNER_TEMP）
-      - name: Export GOOGLE_APPLICATION_CREDENTIALS
-        shell: bash
-        run: echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> $GITHUB_ENV
-
+      # ✅ 用 env 注入 secret，避免條件判斷被 *** 遮蔽；用 POSIX [ ] 相容 sh/bash
       - name: Write GCP service account key
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         shell: bash
         run: |
-          if [[ -z "${{ secrets.GCP_SA_KEY }}" ]]; then
-            echo "❌ Missing secret GCP_SA_KEY"; exit 1;
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "❌ Missing secret GCP_SA_KEY" >&2
+            exit 1
           fi
-          echo "${{ secrets.GCP_SA_KEY }}" > "$RUNNER_TEMP/gcp-key.json"
+          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
           echo "✅ SA key written to $RUNNER_TEMP/gcp-key.json"
 
       - name: Setup Python
@@ -40,14 +41,32 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install base deps
+      - name: Install base deps (Vision/Firestore/Auth/HTTP/Numpy)
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install google-cloud-vision google-cloud-firestore requests numpy \
                      google-auth google-auth-transport-requests
 
-      - name: Connectivity tests
+      - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
+        if: ${{ env.ENABLE_EMBEDDING == '1' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgl1
+          pip install pillow opencv-python dlib==19.24.4 face_recognition scikit-learn
+
+      - name: Init SQLite if present (optional)
+        if: ${{ hashFiles('db/init_db.py') != '' }}
+        run: python db/init_db.py
+
+      - name: Connectivity tests (Vision / Firestore / Cloud Run)
+        if: ${{ hashFiles('scripts/gcp_connect_test.py') != '' }}
         run: python scripts/gcp_connect_test.py
+
+      - name: Integrated face flow (Vision→Embed→Firestore→Cloud Run)
+        if: ${{ env.ENABLE_EMBEDDING == '1' && hashFiles('scripts/integrated_face_flow.py') != '' }}
+        run: python scripts/integrated_face_flow.py
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
@@ -58,4 +77,5 @@ jobs:
             vision_test.log
             firestore_test.log
             cloudrun_test.log
-          if-no-files-found: warn   # ← 一定要在 with: 底下，而且是 v4
+            integrated_test.log
+          if-no-files-found: warn
