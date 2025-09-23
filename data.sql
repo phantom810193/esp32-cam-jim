@@ -1,5 +1,8 @@
+-- Reset tables
 DROP TABLE IF EXISTS visits;
 DROP TABLE IF EXISTS users;
+
+-- Users table
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -8,6 +11,7 @@ CREATE TABLE users (
     total_spend REAL NOT NULL
 );
 
+-- Visits table
 CREATE TABLE visits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -18,6 +22,7 @@ CREATE TABLE visits (
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
+-- Seed users
 INSERT INTO users (id, created_at, last_visit, last_purchase, total_spend) VALUES
     ('ID-abc123', '2024-01-01T10:00:00', '2024-02-15T11:00:00', 'Milk', 320.0);
 INSERT INTO users (id, created_at, last_visit, last_purchase, total_spend) VALUES
@@ -29,6 +34,7 @@ INSERT INTO users (id, created_at, last_visit, last_purchase, total_spend) VALUE
 INSERT INTO users (id, created_at, last_visit, last_purchase, total_spend) VALUES
     ('ID-mno345', '2024-01-10T16:50:00', '2024-02-16T14:55:00', 'Cheese', 520.0);
 
+-- Seed visits
 INSERT INTO visits (user_id, visit_time, purchase, spend, source) VALUES
     ('ID-abc123', '2024-02-15T11:00:00', 'Milk', 80.0, 'seed');
 INSERT INTO visits (user_id, visit_time, purchase, spend, source) VALUES
