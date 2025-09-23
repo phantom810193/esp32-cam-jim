@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found; skipping."
+          fi
+          pip install pytest
+
+      - name: Run pytest (unit only; ignore integration scripts)
+        run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
+
+  gcp-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # ---------- 常規設定 ----------
+      GCP_PROJECT:                 ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
+      CLOUD_RUN_URL:               ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
+      CLOUD_RUN_HEALTH_PATH:       ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
+      CLOUD_RUN_DETECT_PATH:       ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
+      FIRESTORE_COLLECTION:        ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
+      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'visits' }}
+      FIRESTORE_DATABASE_ID:       ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
+      # ---------- 旗標 ----------
+      RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING == '1' || secrets.ENABLE_EMBEDDING == '1') && '1' || '0' }}
+      # ---------- 其他可調參數 ----------
+      SAMPLES_DIR:    ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
+      N_IMAGES:       ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}
+      THRESHOLD:      ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
+      TARGET_ACC:     ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
+      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}
+      USE_VISION:     ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
+
+    steps:
+      - name: Check for GCP key (gate the job)
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "SKIP_GCP=1" >> "$GITHUB_ENV"
+            echo "### gcp-tests skipped: missing secrets.GCP_SA_KEY" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/checkout@v4
+        if: env.SKIP_GCP != '1'
+
+      - name: Print resolved flags
+        if: env.SKIP_GCP != '1'
+        shell: bash
+        run: |
+          echo "RUN_EMBED_TESTS=$RUN_EMBED_TESTS"
+          echo "USE_VISION=$USE_VISION  N_IMAGES=$N_IMAGES  BASELINE_INDEX=$BASELINE_INDEX  THRESHOLD=$THRESHOLD  TARGET_ACC=$TARGET_ACC"
+
+      - name: Write GCP service account key
+        if: env.SKIP_GCP != '1'
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        shell: bash
+        run: |
+          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
+          python - <<'PY'
+          import json, os
+          p = os.path.join(os.environ["RUNNER_TEMP"], "gcp-key.json")
+          json.load(open(p))
+          print("SA JSON OK:", p)
+          PY
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        if: env.SKIP_GCP != '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install base deps (Vision/Firestore/Auth/HTTP/Numpy)
+        if: env.SKIP_GCP != '1'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
+
+      - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
+        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgl1
+          pip install pillow opencv-python "dlib==19.24.4" face_recognition face_recognition_models scikit-learn
+
+      - name: Install project requirements if present
+        if: env.SKIP_GCP != '1'
+        shell: bash
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Connectivity tests (Vision / Firestore / Cloud Run)
+        if: env.SKIP_GCP != '1' && hashFiles('scripts/gcp_connect_test.py') != ''
+        continue-on-error: true
+        run: python scripts/gcp_connect_test.py
+
+      - name: ID batch test (Vision+embedding)
+        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/id_batch_test.py') != ''
+        continue-on-error: true
+        run: python scripts/id_batch_test.py
+
+      - name: API latency test (/detect_face)
+        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/post_detect_latency.py') != ''
+        continue-on-error: true
+        run: python scripts/post_detect_latency.py
+
+      - name: Fallback copy (ensure id_test.log exists)
+        if: env.SKIP_GCP != '1'
+        shell: bash
+        run: |
+          if [ -f integrated_test.log ] && [ ! -f id_test.log ]; then
+            cp integrated_test.log id_test.log
+          fi
+
+      - name: Upload logs
+        if: env.SKIP_GCP != '1' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcp-logs
+          path: |
+            gcp_test.log
+            vision_test.log
+            firestore_test.log
+            cloudrun_test.log
+            integrated_test.log
+            id_test.log
+            api_test.log
+          if-no-files-found: warn
