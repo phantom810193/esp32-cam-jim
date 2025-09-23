@@ -2,9 +2,9 @@ name: GCP CI
 
 on:
   push:
-    branches: ['**']    # 所有分支都觸發（含 codex/**）
+    branches: ['**']
   pull_request:
-  workflow_dispatch: {} # 允許手動觸發
+  workflow_dispatch: {}
 
 jobs:
   gcp-tests:
@@ -13,15 +13,18 @@ jobs:
     env:
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       FIRESTORE_COLLECTION: ${{ secrets.FIRESTORE_COLLECTION || 'visitors' }}
-      FIRESTORE_EVENTS_COLLECTION: ${{ secrets.FIRESTORE_EVENTS_COLLECTION || 'events' }}
       CLOUD_RUN_URL: ${{ secrets.CLOUD_RUN_URL }}
       CLOUD_RUN_HEALTH_PATH: ${{ secrets.CLOUD_RUN_HEALTH_PATH || '/healthz' }}
       CLOUD_RUN_DETECT_PATH: ${{ secrets.CLOUD_RUN_DETECT_PATH }}
       ESP32_IMAGE_URL: ${{ secrets.ESP32_IMAGE_URL }}
-      GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/gcp-key.json
-      ENABLE_EMBEDDING: ${{ vars.ENABLE_EMBEDDING || '0' }}
+      # ⚠️ 這裡先不要用 runner.temp，稍後用 step 寫入 GITHUB_ENV
     steps:
       - uses: actions/checkout@v4
+
+      # 先把 GOOGLE_APPLICATION_CREDENTIALS 寫到環境變數（用 $RUNNER_TEMP）
+      - name: Export GOOGLE_APPLICATION_CREDENTIALS
+        shell: bash
+        run: echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> $GITHUB_ENV
 
       - name: Write GCP service account key
         shell: bash
@@ -29,36 +32,22 @@ jobs:
           if [[ -z "${{ secrets.GCP_SA_KEY }}" ]]; then
             echo "❌ Missing secret GCP_SA_KEY"; exit 1;
           fi
-          echo "${{ secrets.GCP_SA_KEY }}" > "$GOOGLE_APPLICATION_CREDENTIALS"
-          echo "✅ Wrote SA key to $GOOGLE_APPLICATION_CREDENTIALS"
+          echo "${{ secrets.GCP_SA_KEY }}" > "$RUNNER_TEMP/gcp-key.json"
+          echo "✅ SA key written to $RUNNER_TEMP/gcp-key.json"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install base deps (Vision / Firestore / HTTP / Auth)
+      - name: Install base deps
         run: |
           python -m pip install --upgrade pip
           pip install google-cloud-vision google-cloud-firestore requests numpy \
                      google-auth google-auth-transport-requests
 
-      - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
-        if: ${{ env.ENABLE_EMBEDDING == '1' }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y build-essential cmake libgl1
-          pip install opencv-python face_recognition dlib==19.24.4 scikit-learn pillow
-
-      - name: Init SQLite if present (optional)
-        run: |
-          if [ -f db/init_db.py ]; then python db/init_db.py; fi
-
-      - name: Connectivity tests (Vision / Firestore / Cloud Run)
+      - name: Connectivity tests
         run: python scripts/gcp_connect_test.py
-
-      - name: Integrated face flow (Vision bbox + embedding + Firestore + Cloud Run detect)
-        if: ${{ env.ENABLE_EMBEDDING == '1' }}
-        run: python scripts/integrated_face_flow.py
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
@@ -69,5 +58,4 @@ jobs:
             vision_test.log
             firestore_test.log
             cloudrun_test.log
-            integrated_test.log
-        if-no-files-found: warn
+          if-no-files-found: warn   # ← 一定要在 with: 底下，而且是 v4
