@@ -104,4 +104,5 @@ jobs:
             integrated_test.log
             id_test.log
             api_test.log
+            debug/**
           if-no-files-found: warn
