@@ -28,20 +28,17 @@ jobs:
           else
             echo "No requirements.txt found; skipping."
           fi
-          # 確保有 pytest，避免 "command not found"
           pip install pytest
 
       - name: Run pytest
         run: pytest --maxfail=1 --disable-warnings -q
 
   gcp-tests:
-    # 沒有服務帳戶金鑰就整個 job 跳過（workflow 仍成功）
     if: ${{ secrets.GCP_SA_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
-      # ---------- 常規設定（Variables 優先，否則 Secrets，再給預設） ----------
       GCP_PROJECT:                 ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
       CLOUD_RUN_URL:               ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
       CLOUD_RUN_HEALTH_PATH:       ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
@@ -49,16 +46,12 @@ jobs:
       FIRESTORE_COLLECTION:        ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
       FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'visits' }}
       FIRESTORE_DATABASE_ID:       ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
-
-      # ---------- 嵌入/批次測試旗標（true→'1'，false→'0'） ----------
       RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING == '1' || secrets.ENABLE_EMBEDDING == '1') && '1' || '0' }}
-
-      # ---------- 其他可調參數 ----------
       SAMPLES_DIR:    ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES:       ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}        # 0 = 全部
+      N_IMAGES:       ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}
       THRESHOLD:      ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
       TARGET_ACC:     ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
-      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}  # -1 自動找
+      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}
       USE_VISION:     ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
 
     steps:
@@ -77,11 +70,11 @@ jobs:
         run: |
           printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
           python - <<'PY'
-import json, os
-p = os.environ["RUNNER_TEMP"] + "/gcp-key.json"
-json.load(open(p))
-print("SA JSON OK:", p)
-PY
+          import json, os
+          p = os.path.join(os.environ["RUNNER_TEMP"], "gcp-key.json")
+          json.load(open(p))
+          print("SA JSON OK:", p)
+          PY
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
 
       - name: Set up Python
