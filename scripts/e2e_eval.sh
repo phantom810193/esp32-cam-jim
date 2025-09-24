@@ -30,6 +30,12 @@ cd "${REPO_ROOT}"
 OUTPUT_LOCAL_DIR="${REPO_ROOT}/${OUTPUT_LOCAL}"
 mkdir -p "${OUTPUT_LOCAL_DIR}"
 export RUN_DIR="${OUTPUT_LOCAL_DIR}"
+DEBUG_LOG="${OUTPUT_LOCAL_DIR}/debug.log"
+touch "${DEBUG_LOG}"
+
+log_debug() {
+  printf '%s\n' "$1" >>"${DEBUG_LOG}"
+}
 
 EMBEDDING_LOCAL_PATH="${OUTPUT_LOCAL_DIR}/datapoints-00001-of-00001.json"
 STAGING_GCS_PATH="${STAGING_GCS}/datapoints-00001-of-00001.json"
@@ -288,88 +294,92 @@ if [[ "${HAS_EMBEDDINGS}" -eq 1 ]]; then
       candidate="${DEPLOY_ID}_${attempt}"
     fi
     echo "[INFO] Deploy attempt ${attempt} with deployed-index-id=${candidate}"
-    set +e
-    deploy_output=$(gcloud ai index-endpoints deploy-index "${ENDPOINT_ID}" \
+    OUT="$(gcloud ai index-endpoints deploy-index "${ENDPOINT_ID}" \
       --region="${REGION}" \
       --index="${INDEX_STREAM}" \
       --deployed-index-id="${candidate}" \
-      --display-name="${candidate}" \
-      --no-sync 2>&1)
-    status=$?
-    set -e
-    if [[ ${status} -eq 0 ]]; then
-      OP_DEPLOY=$(printf '%s\n' "${deploy_output}" | sed -n 's/.*operations\/\([0-9]\{5,\}\).*/\1/p' | tail -1)
-      if [[ -z "${OP_DEPLOY}" ]]; then
-        echo "[ERROR] Unable to parse deployment operation from gcloud output." >&2
-        exit 1
-      fi
-      echo "[INFO] Waiting for operation operations/${OP_DEPLOY}"
-      deploy_error=""
-      while true; do
-        poll_output=$(gcloud ai operations describe "${OP_DEPLOY}" \
-          --index-endpoint="${ENDPOINT_SHORT}" \
-          --region="${REGION}" \
-          --format='json(done,error)' 2>&1)
-        poll_status=$?
-        if [[ ${poll_status} -ne 0 ]]; then
-          echo "[WARN] Failed to poll operation operations/${OP_DEPLOY}: ${poll_output}" >&2
-          sleep 10
-          continue
-        fi
-        parsed=$(printf '%s' "${poll_output}" | python3 <<'PY'
-import json
-import sys
-
-data = json.load(sys.stdin)
-done = 'true' if data.get('done') else 'false'
-error = data.get('error')
-message = ''
-if error:
-    message = error.get('message') or json.dumps(error)
-print(done)
-print(message)
-PY
-)
-        IFS=$'\n' read -r done_flag error_msg <<< "${parsed}"
-        if [[ "${done_flag}" != "true" ]]; then
-          sleep 10
-          continue
-        fi
-        if [[ -n "${error_msg}" ]]; then
-          deploy_error="${error_msg}"
-        fi
-        break
-      done
-      if [[ -n "${deploy_error}" ]]; then
-        echo "[WARN] Deployment operation returned error: ${deploy_error}" >&2
+      --display-name="${candidate}" 2>&1 || true)"
+    if echo "${OUT}" | grep -q "ALREADY_EXISTS"; then
+      echo "[WARN] Deployment ID already exists. Retrying with a new ID."
+      log_debug "[WARN] deploy attempt ${attempt} failed: ALREADY_EXISTS"
+      log_debug "[DETAIL] ${OUT}"
+      continue
+    fi
+    if echo "${OUT}" | grep -q "INTERNAL"; then
+      echo "[WARN] Deployment encountered INTERNAL error. Retrying with a new ID."
+      log_debug "[WARN] deploy attempt ${attempt} failed: INTERNAL"
+      log_debug "[DETAIL] ${OUT}"
+      continue
+    fi
+    OP_ID="$(sed -n 's/.*operations\/\([0-9]\{6,\}\).*/\1/p' <<<"${OUT}" | tail -1)"
+    if [[ -z "${OP_ID}" ]]; then
+      echo "[ERROR] cannot parse operation id"
+      log_debug "[ERROR] cannot parse operation id"
+      log_debug "[DETAIL] ${OUT}"
+      exit 1
+    fi
+    echo "[INFO] Waiting for operation ${OP_ID}"
+    poll_error=""
+    poll_success=0
+    for i in {1..120}; do
+      LINE=$(gcloud ai operations describe "${OP_ID}" \
+        --index-endpoint="${ENDPOINT_SHORT}" \
+        --region="${REGION}" \
+        --format='value(done,error.message)' 2>&1)
+      status=$?
+      if [[ ${status} -ne 0 ]]; then
+        echo "[WARN] Failed to poll operation ${OP_ID}: ${LINE}" >&2
+        log_debug "[WARN] poll attempt ${i} failed for ${OP_ID}: ${LINE}"
+        sleep 10
         continue
       fi
+      LINE="${LINE//$'\t'/ }"
+      DONE="${LINE%% *}"
+      if [[ "${DONE}" == "${LINE}" ]]; then
+        ERR=""
+      else
+        ERR="${LINE#* }"
+      fi
+      if [[ "${DONE}" == "True" || "${DONE}" == "true" ]]; then
+        if [[ -n "${ERR}" && "${ERR}" != "None" ]]; then
+          poll_error="${ERR}"
+        fi
+        poll_success=1
+        break
+      fi
+      if [[ -n "${ERR}" && "${ERR}" != "None" ]]; then
+        poll_error="${ERR}"
+        break
+      fi
+      sleep 10
+    done
+    if [[ ${poll_success} -eq 1 && -z "${poll_error}" ]]; then
       DEPLOY_ID="${candidate}"
       deployed=1
       echo "[INFO] Deployment completed with deployed-index-id=${DEPLOY_ID}"
-      describe_output=$(gcloud ai index-endpoints describe "${ENDPOINT_ID}" \
-        --region="${REGION}" \
-        --format="table(deployedIndexes.id,deployedIndexes.index,deployedIndexes.createTime)")
-      if [[ -n "${describe_output}" ]]; then
-        echo "[INFO] Current deployments:"
-        printf '%s\n' "${describe_output}"
-      fi
+      gcloud ai index-endpoints describe "${ENDPOINT_ID}" --region="${REGION}" \
+        --format="table(deployedIndexes.id,deployedIndexes.index,deployedIndexes.createTime)"
     else
-      if echo "${deploy_output}" | grep -q "ALREADY_EXISTS"; then
-        echo "[WARN] Deployment ID already exists. Retrying with a new ID."
-        continue
+      if [[ -n "${poll_error}" ]]; then
+        echo "[ERROR] ${poll_error}"
+        log_debug "[ERROR] deployment error for ${candidate}: ${poll_error}"
+        if [[ ${attempt} -lt 3 ]]; then
+          if [[ "${poll_error}" == *ALREADY_EXISTS* || "${poll_error}" == *already\ exists* || "${poll_error}" == *INTERNAL* ]]; then
+            echo "[INFO] Retrying deployment with a new ID."
+            continue
+          fi
+        fi
+        exit 1
+      else
+        echo "[ERROR] Deployment timed out waiting for operation ${OP_ID}" >&2
+        log_debug "[ERROR] deployment timed out for ${candidate} (operation ${OP_ID})"
+        exit 1
       fi
-      if echo "${deploy_output}" | grep -q "INTERNAL"; then
-        echo "[WARN] Deployment hit INTERNAL error. Retrying with a new ID."
-        continue
-      fi
-      echo "${deploy_output}" >&2
-      echo "[ERROR] Failed to deploy index." >&2
-      exit ${status}
     fi
   done
   if [[ ${deployed} -eq 0 ]]; then
     echo "[ERROR] Unable to deploy index after multiple attempts." >&2
+    log_debug "[ERROR] Unable to deploy index after multiple attempts"
     exit 1
   fi
 else
