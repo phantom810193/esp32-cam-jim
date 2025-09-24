@@ -8,6 +8,7 @@ if [[ -z "${PROJECT_ID}" || "${PROJECT_ID}" == "(unset)" ]]; then
   exit 1
 fi
 ENDPOINT_ID=${ENDPOINT_ID:-projects/665759721336/locations/asia-east1/indexEndpoints/9005598365810950144}
+IDX_DISPLAY=${IDX_DISPLAY:-faces-index-stream-bf}
 
 BUCKET_DATA=${BUCKET_DATA:-esp32cam-472912-vertex-data}
 BUCKET_STAGING=${BUCKET_STAGING:-esp32cam-472912-vertex-staging}
@@ -28,6 +29,7 @@ cd "${REPO_ROOT}"
 
 OUTPUT_LOCAL_DIR="${REPO_ROOT}/${OUTPUT_LOCAL}"
 mkdir -p "${OUTPUT_LOCAL_DIR}"
+export RUN_DIR="${OUTPUT_LOCAL_DIR}"
 
 EMBEDDING_LOCAL_PATH="${OUTPUT_LOCAL_DIR}/datapoints-00001-of-00001.json"
 STAGING_GCS_PATH="${STAGING_GCS}/datapoints-00001-of-00001.json"
@@ -142,15 +144,42 @@ if [[ -z "${INDEX_STREAM:-}" ]]; then
   }
 }
 JSON
-  INDEX_STREAM=$(gcloud ai indexes create \
+  gcloud ai indexes create \
     --region="${REGION}" \
-    --display-name="faces-index-stream-bf" \
+    --display-name="${IDX_DISPLAY}" \
     --metadata-file="${INDEX_DEF_FILE}" \
     --index-update-method=STREAM_UPDATE \
-    --format="value(name)")
+    >/dev/null
+  INDEX_STREAM=$(gcloud ai indexes list \
+    --region="${REGION}" \
+    --filter="displayName=\"${IDX_DISPLAY}\"" \
+    --format='value(name)' | tail -1)
+  if [[ -z "${INDEX_STREAM}" ]]; then
+    echo "[ERROR] Failed to retrieve index resource for displayName=${IDX_DISPLAY}." >&2
+    exit 1
+  fi
+  if [[ "${INDEX_STREAM}" != projects/* ]]; then
+    echo "[ERROR] Unexpected index identifier returned: ${INDEX_STREAM}" >&2
+    exit 1
+  fi
   export INDEX_STREAM
   echo "[INFO] Created index: ${INDEX_STREAM}"
 else
+  if [[ "${INDEX_STREAM}" != projects/* ]]; then
+    INDEX_STREAM=$(gcloud ai indexes list \
+      --region="${REGION}" \
+      --filter="displayName=\"${IDX_DISPLAY}\"" \
+      --format='value(name)' | tail -1)
+    if [[ -z "${INDEX_STREAM}" ]]; then
+      echo "[ERROR] Unable to resolve existing index via displayName=${IDX_DISPLAY}." >&2
+      exit 1
+    fi
+    if [[ "${INDEX_STREAM}" != projects/* ]]; then
+      echo "[ERROR] Resolved index identifier is invalid: ${INDEX_STREAM}" >&2
+      exit 1
+    fi
+  fi
+  export INDEX_STREAM
   echo "[INFO] Using existing index: ${INDEX_STREAM}"
 fi
 
@@ -246,6 +275,7 @@ else
 fi
 
 DEPLOY_ID="faces_stream_${RUN_ID//[-:]/}"
+ENDPOINT_SHORT=$(basename "${ENDPOINT_ID}")
 
 if [[ "${HAS_EMBEDDINGS}" -eq 1 ]]; then
   echo "[INFO] Deploying index ${INDEX_STREAM} to endpoint ${ENDPOINT_ID}"
@@ -259,57 +289,81 @@ if [[ "${HAS_EMBEDDINGS}" -eq 1 ]]; then
     fi
     echo "[INFO] Deploy attempt ${attempt} with deployed-index-id=${candidate}"
     set +e
-    deploy_json=$(gcloud ai index-endpoints deploy-index "${ENDPOINT_ID}" \
+    deploy_output=$(gcloud ai index-endpoints deploy-index "${ENDPOINT_ID}" \
       --region="${REGION}" \
       --index="${INDEX_STREAM}" \
       --deployed-index-id="${candidate}" \
       --display-name="${candidate}" \
-      --no-sync \
-      --format="json" 2>&1)
+      --no-sync 2>&1)
     status=$?
     set -e
     if [[ ${status} -eq 0 ]]; then
-      operation=$(python3 -c "import json,sys; data=json.loads(sys.argv[1]); print(data.get('name',''))" "${deploy_json}")
-      if [[ -z "${operation}" ]]; then
-        echo "[ERROR] Unable to parse deployment operation." >&2
+      OP_DEPLOY=$(printf '%s\n' "${deploy_output}" | sed -n 's/.*operations\/\([0-9]\{5,\}\).*/\1/p' | tail -1)
+      if [[ -z "${OP_DEPLOY}" ]]; then
+        echo "[ERROR] Unable to parse deployment operation from gcloud output." >&2
         exit 1
       fi
-      echo "[INFO] Waiting for operation ${operation}"
-      DEPLOY_OPERATION="${operation}" REGION="${REGION}" python3 <<'PY'
-import os
-import time
-from google.cloud import aiplatform_v1
+      echo "[INFO] Waiting for operation operations/${OP_DEPLOY}"
+      deploy_error=""
+      while true; do
+        poll_output=$(gcloud ai operations describe "${OP_DEPLOY}" \
+          --index-endpoint="${ENDPOINT_SHORT}" \
+          --region="${REGION}" \
+          --format='json(done,error)' 2>&1)
+        poll_status=$?
+        if [[ ${poll_status} -ne 0 ]]; then
+          echo "[WARN] Failed to poll operation operations/${OP_DEPLOY}: ${poll_output}" >&2
+          sleep 10
+          continue
+        fi
+        parsed=$(printf '%s' "${poll_output}" | python3 <<'PY'
+import json
+import sys
 
-operation_name = os.environ["DEPLOY_OPERATION"]
-region = os.environ["REGION"]
-
-client = aiplatform_v1.IndexEndpointServiceClient(
-    client_options={"api_endpoint": f"{region}-aiplatform.googleapis.com"}
-)
-
-operations_client = client.transport.operations_client
-
-while True:
-    operation = operations_client.get_operation(operation_name)
-    if operation.done:
-        if operation.error.code:
-            raise SystemExit(f"Deployment operation failed: {operation.error.message}")
-        break
-    time.sleep(10)
+data = json.load(sys.stdin)
+done = 'true' if data.get('done') else 'false'
+error = data.get('error')
+message = ''
+if error:
+    message = error.get('message') or json.dumps(error)
+print(done)
+print(message)
 PY
+)
+        IFS=$'\n' read -r done_flag error_msg <<< "${parsed}"
+        if [[ "${done_flag}" != "true" ]]; then
+          sleep 10
+          continue
+        fi
+        if [[ -n "${error_msg}" ]]; then
+          deploy_error="${error_msg}"
+        fi
+        break
+      done
+      if [[ -n "${deploy_error}" ]]; then
+        echo "[WARN] Deployment operation returned error: ${deploy_error}" >&2
+        continue
+      fi
       DEPLOY_ID="${candidate}"
       deployed=1
       echo "[INFO] Deployment completed with deployed-index-id=${DEPLOY_ID}"
+      describe_output=$(gcloud ai index-endpoints describe "${ENDPOINT_ID}" \
+        --region="${REGION}" \
+        --format="table(deployedIndexes.id,deployedIndexes.index,deployedIndexes.createTime)")
+      if [[ -n "${describe_output}" ]]; then
+        echo "[INFO] Current deployments:"
+        printf '%s\n' "${describe_output}"
+      fi
     else
-      if echo "${deploy_json}" | grep -q "ALREADY_EXISTS"; then
+      if echo "${deploy_output}" | grep -q "ALREADY_EXISTS"; then
         echo "[WARN] Deployment ID already exists. Retrying with a new ID."
         continue
       fi
-      if echo "${deploy_json}" | grep -q "INTERNAL"; then
+      if echo "${deploy_output}" | grep -q "INTERNAL"; then
         echo "[WARN] Deployment hit INTERNAL error. Retrying with a new ID."
         continue
       fi
-      echo "${deploy_json}" >&2
+      echo "${deploy_output}" >&2
       echo "[ERROR] Failed to deploy index." >&2
       exit ${status}
     fi
