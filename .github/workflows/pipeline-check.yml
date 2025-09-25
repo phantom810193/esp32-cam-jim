@@ -13,8 +13,6 @@ env:
   PROJECT_ID: esp32cam-472912
   REGION: asia-east1
   SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
-
-  # If you will run Vertex Pipeline / Eventarc, replace these with real GCS paths.
   PIPELINE_DEF: pipelines/face_enroll_recognize.json
   PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
   GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
@@ -67,7 +65,6 @@ jobs:
           gcloud auth list
           echo "== List Cloud Run services (${REGION}) =="
           gcloud run services list --region="${REGION}" || exit 1
-          # Try listing buckets if gs:// provided
           for uri in "${PIPELINE_ROOT}" "${GCS_INBOX}"; do
             if echo "$uri" | grep -q '^gs://'; then
               bucket="$(echo "$uri" | sed 's#^gs://\([^/]*\).*#\1#')"
@@ -76,14 +73,12 @@ jobs:
             fi
           done
 
-      # Optional: Vertex AI Pipeline
       - name: Run Vertex Pipeline (enroll batch) - conditional
         id: run_pipeline
         shell: bash
         run: |
           set -euo pipefail
           if [ -f "${PIPELINE_DEF}" ] && echo "${PIPELINE_ROOT}" | grep -q '^gs://'; then
-            echo "Submitting Vertex pipeline..."
             JOB_NAME=$(gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
               --region="${REGION}" \
               --pipeline-definition-file="${PIPELINE_DEF}" \
@@ -106,7 +101,6 @@ jobs:
           echo "Waiting for ${JOB_NAME} ..."
           gcloud ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
 
-      # Optional: trigger Eventarc by uploading a file to GCS_INBOX
       - name: Upload a test photo to trigger Eventarc - conditional
         if: ${{ startsWith(env.GCS_INBOX, 'gs://') }}
         shell: bash
@@ -120,9 +114,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${SERVICE_URL}/health"
+          curl -fsSL "${SERVICE_URL%/}/health"
 
-      # Black-box E2E: enroll A/B and recognize A
       - name: Smoke test - multi-person enroll and recognize
         shell: bash
         run: |
@@ -132,7 +125,6 @@ jobs:
           curl -fsSLo /tmp/faces/A/2.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0002.jpg
           curl -fsSLo /tmp/faces/B/1.jpg https://vis-www.cs.umass.edu/lfw/images/Tony_Blair/Tony_Blair_0001.jpg
 
-          # Avoid YAML-heredoc: one-line function, no newline in output
           b64() { base64 -w 0 "$1"; }
 
           A1=$(b64 /tmp/faces/A/1.jpg)
@@ -140,27 +132,29 @@ jobs:
           B1=$(b64 /tmp/faces/B/1.jpg)
 
           echo "== Enroll A =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
             -d "{\"user_id\":\"test-A\",\"images\":[\"data:image/jpeg;base64,$A1\",\"data:image/jpeg;base64,$A2\"]}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
 
           echo "== Enroll B =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
             -d "{\"user_id\":\"test-B\",\"images\":[\"data:image/jpeg;base64,$B1\"]}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
 
           echo "== Recognize A (should match test-A) =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/detect_face" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/detect_face" \
             -H 'Content-Type: application/json' \
             -d "{\"images\":[\"data:image/jpeg;base64,$A1\"],\"purchase\":\"Milk\"}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
           if ! echo "$BODY" | jq -e '.user_id=="test-A" or .match_user=="test-A" or .is_same_person==true' >/dev/null; then
-            echo "::error::Expect a positive match for person A"; exit 1; fi
+            echo "Expect a positive match for person A"
+            exit 1
+          fi
 
       - name: Prove OIDC in Audit Logs (last 60m)
         shell: bash
@@ -174,4 +168,4 @@ jobs:
           | jq -r '.[].protoPayload.authenticationInfo.principalSubject' \
           | tee /tmp/subjects.txt
           echo "Look for principal://iam.googleapis.com/projects/${PROJECT_NUM}/locations/global/workloadIdentityPools/..."
-          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "Found OIDC principal" || (echo "::warning::No OIDC principal found"; exit 1)
+          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "Found OIDC principal" || { echo "No OIDC principal found"; exit 1; }
