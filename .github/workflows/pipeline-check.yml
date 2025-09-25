@@ -146,13 +146,27 @@ jobs:
           echo "ADC file: ${GOOGLE_APPLICATION_CREDENTIALS:-<none>}"
           gcloud --version
 
-          # 先用 ADC 取 ID Token；若該子命令不存在或失敗，改用 google-auth 備援
+          # 先用 gcloud（ADC）取；若該子命令不存在或失敗，改用 google-auth 備援
           if IDT="$(gcloud auth application-default print-identity-token --audiences="$BASE" 2>/dev/null)"; then
             :
           else
             python3 -m pip install --quiet --upgrade google-auth
-            IDT="$(BASE="$BASE" python3 -c 'from google.auth.transport.requests import Request; from google.oauth2.id_token import fetch_id_token; import os; aud = os.environ["BASE"]; print(fetch_id_token(Request(), aud))')"
+            IDT="$(BASE="$BASE" ADC="$GOOGLE_APPLICATION_CREDENTIALS" python3 - <<'PY'
+              from google.auth.transport.requests import Request
+              from google.auth import load_credentials_from_file
+              from google.oauth2 import id_token
+              import os
+
+              aud = os.environ["BASE"]
+              adc = os.environ["ADC"]  # 指向 gha-creds-*.json（external_account）
+              creds, _ = load_credentials_from_file(adc)  # 明確載入 ADC（支援 WIF/external_account）
+              tok = id_token.IDTokenCredentials.from_credentials(creds, target_audience=aud)
+              tok.refresh(Request())
+              print(tok.token)
+            PY
+            )"
           fi
+
           echo "id_token=$IDT" >> "$GITHUB_OUTPUT"
 
       - name: Probe Cloud Run /health (no impersonation)
