@@ -58,7 +58,7 @@ jobs:
         run: echo "No test files detected; skipping pytest."
 
   pipeline-check:
-    # needs: tests   # 若要先跑本地測試再跑，移除註解
+    # needs: tests   # 若要先跑單元測試再跑，取消註解
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -66,15 +66,15 @@ jobs:
       contents: read
 
     env:
-      # ------- GCP 基本 -------
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
 
-      # ------- 從 repo Variables 讀取（建議在 Settings → Secrets and variables → Actions → Variables 設定）-------
-      SERVICE_URL: ${{ vars.SERVICE_URL }}     # 例：https://esp32-cam-jim-665759721336.asia-east1.run.app
-      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }} # 例：gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root
-      GCS_INBOX: ${{ vars.GCS_INBOX }}         # 例：gs://esp32cam-472912-faces/new_photos
+      # ★ 這四個建議放在 repo → Settings → Secrets and variables → Actions → Variables
+      SERVICE_URL: ${{ vars.SERVICE_URL }}           # 例：https://esp32-cam-jim-665759721336.asia-east1.run.app
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}       # 例：gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root
+      GCS_INBOX: ${{ vars.GCS_INBOX }}               # 例：gs://esp32cam-472912-faces/new_photos
       SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://esp32cam-472912-vertex-data/faces/personA
+
       PIPELINE_DEF: pipelines/face_enroll_recognize.json
 
     steps:
@@ -92,14 +92,17 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Sanity check (required env/vars exist)
+      - name: Sanity check env
         run: |
           set -e
-          : "${SERVICE_URL:?SERVICE_URL missing (set repo variable)}"
-          : "${PIPELINE_ROOT:?PIPELINE_ROOT missing (set repo variable)}"
-          : "${GCS_INBOX:?GCS_INBOX missing (set repo variable)}"
-          : "${SAMPLES_ROOT_URI:?SAMPLES_ROOT_URI missing (set repo variable)}"
-          test -f "${PIPELINE_DEF}" || (echo "Missing ${PIPELINE_DEF}" && exit 1)
+          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
+            if [ -z "${!v}" ]; then
+              echo "Missing required variable: $v (set repo variable in Settings → Actions → Variables)"; exit 1;
+            fi
+          done
+          if [ ! -f "${PIPELINE_DEF}" ]; then
+            echo "Missing ${PIPELINE_DEF} in repo"; exit 1;
+          fi
           echo "SERVICE_URL=${SERVICE_URL}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
           echo "GCS_INBOX=${GCS_INBOX}"
@@ -126,39 +129,57 @@ jobs:
         run: |
           set -e
           echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
+          # 列出一層子資料夾，例如 .../personA/Alanna/
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
             person=$(basename "${dir%/}")
             src="${dir}01.jpg"
             ts=$(date +%s)
-            dst="${GCS_INBOX%/}/ci_${person}_${ts}.jpg"
-            echo "cp $src -> $dst"
-            gsutil cp "$src" "$dst" || echo "Skip (no 01.jpg): $src"
+            # 確保 GCS_INBOX 沒有尾斜線
+            inbox="${GCS_INBOX%/}"
+            dst="${inbox}/ci_${person}_${ts}.jpg"
+            echo "cp ${src} -> ${dst}"
+            if gsutil -q stat "${src}"; then
+              gsutil cp "${src}" "${dst}"
+            else
+              echo "Skip (no 01.jpg): ${src}"
+            fi
           done
 
       - name: Recognize via API for each person
         run: |
           set -e
           fails=0
+          # 先寫入一個臨時 Python 檔，避免 heredoc 解析問題
+          cat > /tmp/post_detect.py <<'PY'
+import base64, json, os, sys, urllib.request
+img_path = sys.argv[1]
+person = sys.argv[2]
+service_url = os.environ["SERVICE_URL"].rstrip("/") + "/detect_face"
+with open(img_path, "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
+req = urllib.request.Request(service_url, data=payload, headers={"Content-Type": "application/json"})
+resp = urllib.request.urlopen(req, timeout=120)
+print(resp.read().decode())
+PY
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
             person=$(basename "${dir%/}")
             img="/tmp/02_${person}.jpg"
-            if gsutil cp "${dir}02.jpg" "$img"; then
-              IMG="$img" PERSON="$person" python3 - <<'PY' || fails=$((fails+1))
-import base64, json, os, urllib.request
-img=os.environ["IMG"]; person=os.environ["PERSON"]
-url=os.environ["SERVICE_URL"].rstrip("/") + "/detect_face"
-with open(img,"rb") as f: b64=base64.b64encode(f.read()).decode()
-payload=json.dumps({"images":[f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
-print("POST", url, "for", person)
-resp=urllib.request.urlopen(urllib.request.Request(url, data=payload, headers={"Content-Type":"application/json"}), timeout=120)
-print(resp.read().decode())
-PY
+            if gsutil -q stat "${dir}02.jpg"; then
+              gsutil cp "${dir}02.jpg" "$img"
+              echo "POST /detect_face for ${person}"
+              if ! python3 /tmp/post_detect.py "$img" "$person"; then
+                echo "FAIL: ${person}"
+                fails=$((fails+1))
+              fi
             else
-              echo "Skip (no 02.jpg): ${person}"
+              echo "Skip (no 02.jpg): ${dir}02.jpg"
             fi
           done
-          echo "fails=$fails"
-          [ "$fails" -eq 0 ] || exit 1
+          echo "fails=${fails}"
+          if [ "$fails" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Upload logs (if any)
         if: always()
