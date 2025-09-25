@@ -71,8 +71,7 @@ jobs:
 
   # 2) GCP 端到端驗證（OIDC）
   pipeline-check:
-    # 若希望部署前必須通過本地測試，解除下一行註解
-    # needs: tests
+    # needs: tests   # 若希望部署前必須通過本地測試，解除本行註解
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -111,7 +110,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl python3 coreutils
 
-      - name: Sanity check vars
+      - name: Sanity check env
         shell: bash
         run: |
           set -euo pipefail
@@ -121,28 +120,66 @@ jobs:
           echo "PIPELINE_DEF=${PIPELINE_DEF}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
           echo "GCS_INBOX=${GCS_INBOX}"
-          test -f "${PIPELINE_DEF}" || { echo "Missing ${PIPELINE_DEF}"; exit 1; }
+          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
+            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS"; exit 1; }
+          else
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo"; exit 1; }
+          fi
 
-      - name: Run Vertex Pipeline (enroll batch)
+      - name: Submit Vertex Pipeline (REST)
+        id: submit_pipeline
         shell: bash
         run: |
           set -euo pipefail
-          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
-            --region="${REGION}" \
-            --pipeline-definition-file="${PIPELINE_DEF}" \
-            --pipeline-root="${PIPELINE_ROOT}" \
-            --display-name="Enroll Batch via CI" \
-            --labels=ci=codex,stage=enroll \
-            --format="value(name)"
+          SPEC=/tmp/pipeline_spec.json
+          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
+            gsutil cp "${PIPELINE_DEF}" "$SPEC"
+          else
+            cp "${PIPELINE_DEF}" "$SPEC"
+          fi
+          jq . "$SPEC" >/dev/null
 
-      - name: Wait for enroll to finish
+          BODY=/tmp/pipeline_body.json
+          jq -n \
+            --arg display "Enroll Batch via CI" \
+            --arg out "${PIPELINE_ROOT}" \
+            --argjson spec "$(cat "$SPEC")" \
+            '{displayName:$display, pipelineSpec:$spec,
+              runtimeConfig:{gcsOutputDirectory:$out},
+              labels:{ci:"codex", stage:"enroll"}}' > "$BODY"
+
+          ENDPOINT="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/pipelineJobs"
+          TOKEN="$(gcloud auth print-access-token)"
+          RESP=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+                 -X POST "$ENDPOINT" --data-binary @"$BODY")
+          echo "$RESP" | jq .
+          JOB_NAME=$(echo "$RESP" | jq -r '.name')
+          [ -n "$JOB_NAME" ] || { echo "No job name in response"; exit 1; }
+          echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for pipeline to finish (REST)
+        if: ${{ steps.submit_pipeline.outputs.job_name != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
-            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
-          echo "JOB_ID=$JOB_ID"
-          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
+          JOB_NAME="${{ steps.submit_pipeline.outputs.job_name }}"
+          GET_URL="https://${REGION}-aiplatform.googleapis.com/v1/${JOB_NAME}"
+          TOKEN="$(gcloud auth print-access-token)"
+          for i in $(seq 1 60); do
+            RESP=$(curl -sS -H "Authorization: Bearer ${TOKEN}" "$GET_URL")
+            STATE=$(echo "$RESP" | jq -r '.state // .status.state // empty')
+            echo "State: ${STATE:-unknown}"
+            if [ "$STATE" = "PIPELINE_STATE_SUCCEEDED" ]; then
+              exit 0
+            fi
+            if [ "$STATE" = "PIPELINE_STATE_FAILED" ] || [ "$STATE" = "PIPELINE_STATE_CANCELLED" ]; then
+              echo "$RESP" | jq .
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for pipeline"
+          exit 1
 
       - name: Upload a test photo to trigger Eventarc
         shell: bash
