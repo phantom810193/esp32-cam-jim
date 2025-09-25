@@ -1,3 +1,4 @@
+#
 name: WIF Smoke Test
 on: { workflow_dispatch: {} }
 
