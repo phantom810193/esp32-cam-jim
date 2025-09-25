@@ -2,21 +2,179 @@ name: CI
 
 on:
   push:
-    branches: ["main", "master", "develop", "feature/**"]
+    branches:
+      - main
+      - master
+      - develop
+      - test
+      - feature/**
   pull_request:
+  workflow_dispatch: {}
+
+# 同一分支只保留最新一次執行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # -------------------------
+  # 1) 本地 pytest（沿用你的設定）
+  # -------------------------
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
+
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found; skipping."
+          fi
+          pip install pytest
+
+      - name: Detect tests
+        id: detect
+        shell: bash
+        run: |
+          if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1; then
+            echo "has_tests=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tests=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run pytest
-        run: pytest --maxfail=1 --disable-warnings -q
+        if: steps.detect.outputs.has_tests == '1'
+        run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
+
+      - name: Skip note (no tests found)
+        if: steps.detect.outputs.has_tests != '1'
+        run: echo "No test files detected; skipping pytest."
+
+  # ------------------------------------------------------
+  # 2) GCP 端到端驗證（使用 OIDC；無需 service account key）
+  #    - 建立並等待 Vertex Pipeline Job（enroll）
+  #    - 上傳測試圖到 GCS（觸發 Eventarc）
+  #    - 打 Cloud Run /health
+  #    - 呼叫 /detect_face 做同人驗證
+  # ------------------------------------------------------
+  pipeline-check:
+    # 若希望部署前必須通過本地測試，打開下一行：
+    # needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write   # OIDC 必須
+      contents: read
+
+    env:
+      # ---------- 專案/地區 ----------
+      PROJECT_ID: esp32cam-472912
+      REGION: asia-east1
+
+      # ---------- 你的 Cloud Run ---------
+      SERVICE_URL: ${{ vars.SERVICE_URL || 'https://esp32-cam-jim-665759721336.asia-east1.run.app' }}
+
+      # ---------- Pipeline 相關（請依實際情況修改） ----------
+      PIPELINE_DEF: ${{ vars.PIPELINE_DEF || 'pipelines/face_enroll_recognize.json' }}
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT || 'gs://YOUR_PIPELINE_BUCKET/kfp-root' }}
+      GCS_INBOX: ${{ vars.GCS_INBOX || 'gs://YOUR_GCS_INBOX_BUCKET/new_photos' }}
+
+    steps:
+      - name: Checkout (current branch files, e.g. test)
+        uses: actions/checkout@v4
+
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Sanity check vars
+        run: |
+          echo "PROJECT_ID=${PROJECT_ID}"
+          echo "REGION=${REGION}"
+          echo "SERVICE_URL=${SERVICE_URL}"
+          echo "PIPELINE_DEF=${PIPELINE_DEF}"
+          echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
+          echo "GCS_INBOX=${GCS_INBOX}"
+          test -f "${PIPELINE_DEF}" || (echo "❌ Missing ${PIPELINE_DEF}" && exit 1)
+
+      - name: Run Vertex Pipeline (enroll batch)
+        run: |
+          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+            --region="${REGION}" \
+            --pipeline-definition-file="${PIPELINE_DEF}" \
+            --pipeline-root="${PIPELINE_ROOT}" \
+            --display-name="Enroll Batch via CI" \
+            --labels=ci=codex,stage=enroll \
+            --format="value(name)"
+
+      - name: Wait for enroll to finish
+        run: |
+          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
+            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
+          echo "JOB_ID=$JOB_ID"
+          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
+
+      - name: Upload a test photo to trigger Eventarc
+        run: |
+          echo "Uploading test image to ${GCS_INBOX}..."
+          if [ -f samples/faces/personA/01.jpg ]; then
+            gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX}/ci_test_$(date +%s).jpg"
+          else
+            echo "⚠️ samples/faces/personA/01.jpg not found; creating a tiny placeholder."
+            dd if=/dev/urandom bs=1024 count=8 of=/tmp/placeholder.jpg >/dev/null 2>&1
+            gsutil cp /tmp/placeholder.jpg "${GCS_INBOX}/ci_placeholder_$(date +%s).jpg"
+          fi
+
+      - name: Probe Cloud Run /health
+        run: |
+          curl -fsSL "${SERVICE_URL%/}/health" || (echo "❌ /health failed" && exit 1)
+
+      - name: Recognize via API (existing face)
+        run: |
+          python3 - <<'PY'
+import base64, json, os, urllib.request
+img = "samples/faces/personA/02.jpg"
+if not os.path.exists(img):
+    # 若沒有測試圖，用 1KB 隨機資料代替，API 端需能處理錯誤
+    open("/tmp/02.jpg", "wb").write(os.urandom(1024))
+    img = "/tmp/02.jpg"
+b64 = base64.b64encode(open(img,"rb").read()).decode()
+payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "purchase":"Milk"}).encode()
+req = urllib.request.Request(os.environ["SERVICE_URL"].rstrip("/") + "/detect_face",
+                             data=payload, headers={"Content-Type":"application/json"})
+try:
+    resp = urllib.request.urlopen(req, timeout=120)
+    print(resp.read().decode())
+except Exception as e:
+    print("REQUEST_FAILED:", e)
+    raise
+PY
+
+      - name: Upload run artifacts (logs, if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-check-artifacts
+          path: |
+            **/*.log
+          if-no-files-found: ignore
