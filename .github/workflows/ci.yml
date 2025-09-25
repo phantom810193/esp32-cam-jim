@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -46,6 +46,7 @@ jobs:
         id: detect
         shell: bash
         run: |
+          set -euo pipefail
           if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1; then
             echo "has_tests=1" >> "$GITHUB_OUTPUT"
           else
@@ -55,12 +56,16 @@ jobs:
       - name: Run pytest
         if: steps.detect.outputs.has_tests == '1'
         shell: bash
-        run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
+        run: |
+          set -euo pipefail
+          pytest --maxfail=1 --disable-warnings -q --ignore=scripts
 
       - name: Skip note (no tests found)
         if: steps.detect.outputs.has_tests != '1'
         shell: bash
-        run: echo "No test files detected; skipping pytest."
+        run: |
+          set -euo pipefail
+          echo "No test files detected; skipping pytest."
 
   pipeline-check:
     # needs: tests   # 若要先跑單元測試再跑，取消註解
@@ -100,14 +105,16 @@ jobs:
       - name: Sanity check env
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
-            if [ -z "${!v}" ]; then
-              echo "Missing required variable: $v (set repo variable in Settings → Actions → Variables)"; exit 1;
+            if [ -z "${!v:-}" ]; then
+              echo "Missing required variable: $v (set repo variable in Settings → Actions → Variables)" >&2
+              exit 1
             fi
           done
           if [ ! -f "${PIPELINE_DEF}" ]; then
-            echo "Missing ${PIPELINE_DEF} in repo"; exit 1;
+            echo "Missing ${PIPELINE_DEF} in repo" >&2
+            exit 1
           fi
           echo "SERVICE_URL=${SERVICE_URL}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
@@ -117,6 +124,7 @@ jobs:
       - name: Run Vertex Pipeline (enroll batch)
         shell: bash
         run: |
+          set -euo pipefail
           gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
             --region="${REGION}" \
             --pipeline-definition-file="${PIPELINE_DEF}" \
@@ -128,6 +136,7 @@ jobs:
       - name: Wait for enroll to finish
         shell: bash
         run: |
+          set -euo pipefail
           JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
             --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
           echo "JOB_ID=$JOB_ID"
@@ -136,7 +145,7 @@ jobs:
       - name: Upload one test photo per person (trigger Eventarc)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
           # 列出一層子資料夾，例如 .../personA/Alanna/
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
@@ -157,7 +166,7 @@ jobs:
       - name: Recognize via API for each person
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           fails=0
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
             person=$(basename "${dir%/}")
@@ -165,30 +174,21 @@ jobs:
               img="/tmp/02_${person}.jpg"
               gsutil cp "${dir}02.jpg" "$img"
               echo "POST /detect_face for ${person}"
-              if ! python3 - "$img" "$person" <<'PY'
-import base64, json, os, sys, urllib.request
-img_path = sys.argv[1]
-person = sys.argv[2]
-service_url = os.environ["SERVICE_URL"].rstrip("/") + "/detect_face"
-with open(img_path, "rb") as f:
-    b64 = base64.b64encode(f.read()).decode()
-payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
-req = urllib.request.Request(service_url, data=payload, headers={"Content-Type": "application/json"})
-with urllib.request.urlopen(req, timeout=120) as resp:
-    print(resp.read().decode())
-PY
-              then
-                echo "FAIL: ${person}"
-                fails=$((fails+1))
-              fi
+              IMG="$img" PERSON="$person" python3 -c "import base64,json,os,urllib.request
+img=os.environ['IMG']; person=os.environ['PERSON']
+service_url=os.environ['SERVICE_URL'].rstrip('/')+'/detect_face'
+with open(img,'rb') as f:
+  b64=base64.b64encode(f.read()).decode()
+payload=json.dumps({'images':['data:image/jpeg;base64,'+b64],'person':person}).encode()
+req=urllib.request.Request(service_url,data=payload,headers={'Content-Type':'application/json'})
+with urllib.request.urlopen(req,timeout=120) as resp:
+  print(resp.read().decode())" || fails=\$((fails+1))
             else
               echo "Skip (no 02.jpg): ${dir}02.jpg"
             fi
           done
           echo "fails=${fails}"
-          if [ "$fails" -ne 0 ]; then
-            exit 1
-          fi
+          test "$fails" -eq 0
 
       - name: Upload logs (if any)
         if: always()
