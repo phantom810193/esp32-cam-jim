@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,11 +21,40 @@ from database_utils import (
 )
 from vision import FaceRecognitionService
 
+# ---- Optional ArcFace image embedding (server-side) ----
+_ARCFACE_AVAILABLE = False
+_ARCFACE_DIM = 512
+try:
+    from embedding_arcface import embed as arcface_embed  # type: ignore
+    _ARCFACE_AVAILABLE = True
+except Exception:
+    _ARCFACE_AVAILABLE = False
+
 
 def _append_json_line(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _avg(vectors: List[List[float]]) -> List[float]:
+    import numpy as np
+
+    arr = np.asarray(vectors, dtype="float32")
+    v = arr.mean(axis=0)
+    n = float((v**2).sum() ** 0.5) + 1e-9
+    return (v / n).astype("float32").tolist()
+
+
+def _to_arcface_vector_from_image_payload(img_payload: Any) -> List[float]:
+    if not _ARCFACE_AVAILABLE:
+        raise RuntimeError("arcface embedding not available")
+    vec = arcface_embed(img_payload)
+    if hasattr(vec, "tolist"):
+        vec = vec.tolist()
+    if not isinstance(vec, (list, tuple)) or len(vec) != _ARCFACE_DIM:
+        raise ValueError(f"embedding length must be {_ARCFACE_DIM}")
+    return [float(x) for x in vec]
 
 
 def _resolve_embeddings(payload: Dict[str, Any]) -> List[Iterable[float]]:
@@ -33,9 +63,28 @@ def _resolve_embeddings(payload: Dict[str, Any]) -> List[Iterable[float]]:
         single = payload.get("embedding")
         if single is not None:
             embeddings = [single]
+        else:
+            images = payload.get("images")
+            if images:
+                # Compute embeddings on server if available
+                embs = [_to_arcface_vector_from_image_payload(img) for img in images]
+                embeddings = embs
     if not embeddings:
         raise ValueError("missing embeddings")
     return list(embeddings)
+
+
+def _resolve_single_embedding(payload: Dict[str, Any]) -> List[float]:
+    """For /detect_face: accept 'embedding' or single 'image'/'images'."""
+    if "embedding" in payload:
+        return list(payload["embedding"])
+    img = payload.get("image")
+    if img is None:
+        imgs = payload.get("images") or []
+        img = imgs[0] if imgs else None
+    if img is not None:
+        return _to_arcface_vector_from_image_payload(img)
+    raise ValueError("missing embedding")
 
 
 def create_app(config: Dict[str, Any] | None = None) -> Flask:
@@ -45,7 +94,7 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
     db_path = Path(config.get("DB_PATH", "users.db"))
     sql_path = Path(config.get("SQL_PATH", Path(__file__).resolve().parent / "data.sql"))
     api_log_path = Path(config.get("API_LOG_PATH", "api_test.log"))
-    recognition_threshold = float(config.get("THRESHOLD", 0.8))
+    recognition_threshold = float(config.get("THRESHOLD", os.getenv("THRESHOLD", 0.8)))
 
     app.config.update(
         DB_PATH=str(db_path),
@@ -62,13 +111,17 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
         _append_json_line(Path(app.config["API_LOG_PATH"]), log_entry)
         return jsonify(payload), status_code
 
+    @app.get("/health")
+    def health() -> Any:
+        return jsonify({"ok": True, "time": datetime.now(UTC).isoformat()})
+
     @app.post("/enroll")
     def enroll() -> Any:
         start = time.perf_counter()
         try:
             payload = request.get_json(force=True) or {}
             embeddings = _resolve_embeddings(payload)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RuntimeError) as exc:
             return jsonify({"error": str(exc)}), 400
 
         purchase = payload.get("purchase", "Milk")
@@ -118,10 +171,12 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
     @app.post("/detect_face")
     def detect_face() -> Any:
         start = time.perf_counter()
-        payload = request.get_json(force=True) or {}
-        embedding = payload.get("embedding")
-        if embedding is None:
-            return jsonify({"error": "missing embedding"}), 400
+        try:
+            payload = request.get_json(force=True) or {}
+            embedding = _resolve_single_embedding(payload)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
         purchase = payload.get("purchase", "Milk")
         timestamp = payload.get("timestamp") or datetime.now(UTC).isoformat()
         spend = float(payload.get("spend", 100.0))
@@ -178,6 +233,5 @@ def create_app(config: Dict[str, Any] | None = None) -> Flask:
 
 
 app = create_app()
-
 
 __all__ = ["create_app", "app"]

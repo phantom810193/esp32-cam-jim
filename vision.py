@@ -12,7 +12,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 
 DATASET_PATH = Path(__file__).resolve().parent / "sample_data" / "embeddings.json"
 
@@ -26,15 +26,16 @@ class RecognitionResult:
     match: bool
 
 
-def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> float:
-    a = list(vec_a)
-    b = list(vec_b)
+def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> Optional[float]:
+    """Cosine similarity. Return None when dimensions differ (no crash)."""
+    a = [float(x) for x in vec_a]
+    b = [float(x) for x in vec_b]
     if len(a) != len(b):
-        raise ValueError("Embedding vectors must be the same length")
+        return None
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
 
@@ -46,8 +47,10 @@ class FaceRecognitionService:
         self.dataset_path = Path(dataset_path)
         self.threshold = threshold
         self._dataset_cache: Dict[str, List[Dict[str, object]]] | None = None
+        # dynamically enrolled vectors (for tests)
         self._enrolled_embeddings: Dict[str, List[List[float]]] = {}
 
+    # ---------- dataset ----------
     def _load_dataset(self) -> Dict[str, List[Dict[str, object]]]:
         if self._dataset_cache is None:
             with self.dataset_path.open("r", encoding="utf-8") as handle:
@@ -56,7 +59,7 @@ class FaceRecognitionService:
 
     @property
     def customers(self) -> List[Dict[str, object]]:
-        base = [dict(item) for item in self._load_dataset()["customers"]]
+        base = [dict(item) for item in self._load_dataset().get("customers", [])]
         dynamic = [
             {"id": user_id, "embedding": embedding}
             for user_id, embeddings in self._enrolled_embeddings.items()
@@ -66,8 +69,9 @@ class FaceRecognitionService:
 
     @property
     def queries(self) -> List[Dict[str, object]]:
-        return [dict(item) for item in self._load_dataset()["queries"]]
+        return [dict(item) for item in self._load_dataset().get("queries", [])]
 
+    # ---------- enrollment ----------
     def enroll(
         self,
         embeddings: Iterable[Iterable[float]],
@@ -75,7 +79,6 @@ class FaceRecognitionService:
         user_id: str | None = None,
     ) -> Dict[str, object]:
         """Register one or more embeddings for a visitor and return metadata."""
-
         vectors: List[List[float]] = []
         for embedding in embeddings:
             vector = [float(value) for value in embedding]
@@ -87,18 +90,39 @@ class FaceRecognitionService:
         if user_id is None:
             user_id = f"ID-{uuid.uuid4().hex[:6]}"
         self._enrolled_embeddings.setdefault(user_id, []).extend(vectors)
-        return {"id": user_id, "embeddings": vectors}
+        return {
+            "id": user_id,
+            "embeddings": vectors,
+            "embeddings_count": len(vectors),
+            "dim": len(vectors[0]),
+        }
 
+    # ---------- identify & evaluate ----------
     def identify_embedding(self, embedding: Iterable[float]) -> Tuple[str, float, bool]:
-        """Return ``(person_id, confidence, is_new_user)`` for an embedding."""
+        """Return (person_id, confidence, is_new_user) for an embedding.
+
+        Only compares against customers whose embedding dimension equals
+        the query embedding dimension. Dimension mismatches are skipped.
+        """
+        query = [float(x) for x in embedding]
+        qdim = len(query)
 
         best_score = -1.0
-        best_id = None
+        best_id: Optional[str] = None
+
         for customer in self.customers:
-            score = _cosine_similarity(embedding, customer["embedding"])
+            base = customer.get("embedding")
+            if not isinstance(base, (list, tuple)):
+                continue
+            if len(base) != qdim:
+                # skip mismatched dims
+                continue
+            score = _cosine_similarity(query, base)
+            if score is None:
+                continue
             if score > best_score:
                 best_score = score
-                best_id = str(customer["id"])
+                best_id = str(customer.get("id"))
 
         if best_score >= self.threshold and best_id is not None:
             return best_id, best_score, False
@@ -108,7 +132,6 @@ class FaceRecognitionService:
 
     def evaluate_queries(self, log_path: Path | str = "id_test.log") -> Dict[str, object]:
         """Run the bundled evaluation set and persist a JSON log."""
-
         results: List[RecognitionResult] = []
         correct = 0
         for item in self.queries:
@@ -118,11 +141,11 @@ class FaceRecognitionService:
                 correct += 1
             results.append(
                 RecognitionResult(
-                    image=str(item["image"]),
+                    image=str(item.get("image")),
                     predicted_id=predicted_id,
-                    expected_id=str(item["expected_id"]),
-                    confidence=score,
-                    match=match,
+                    expected_id=str(item.get("expected_id")),
+                    confidence=float(score),
+                    match=bool(match),
                 )
             )
 

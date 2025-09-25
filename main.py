@@ -24,22 +24,26 @@ def run_pipeline(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 初始化資料庫
     data_sql_path = Path(__file__).resolve().parent / "data.sql"
     db_path = output_dir / "users.db"
     initialize_database(db_path, data_sql_path, reset=True)
 
     start = time.perf_counter()
+
+    # 相機模擬與效能
     camera_metrics = simulate_camera_capture(
         duration_seconds=5.0,
         target_fps=12.0,
         log_path=output_dir / "cam.log",
     )
-
     stability_report = run_stability_assessment(log_path=output_dir / "cam_stable.log")
 
+    # 人臉辨識測試
     service = FaceRecognitionService()
     recognition_metrics = service.evaluate_queries(log_path=output_dir / "id_test.log")
 
+    # 啟動 Flask 測試 client，測試 /enroll 與 /detect_face
     app = create_app(
         {
             "DB_PATH": db_path,
@@ -50,12 +54,15 @@ def run_pipeline(
     )
     app.config.update(TESTING=True)
 
-    enrollment_payload = {}
-    api_payload = {}
+    enrollment_payload: Dict[str, object] = {}
+    api_payload: Dict[str, object] = {}
+
     with app.test_client() as client:
-        enrollment_embeddings = [query["embedding"] for query in service.queries[:2]] or [
+        # 取前兩筆 query 的 embedding 做 enroll，若不足則取第一筆
+        enrollment_embeddings = [q["embedding"] for q in service.queries[:2]] or [
             service.queries[0]["embedding"]
         ]
+
         enroll_response = client.post(
             "/enroll",
             json={
@@ -72,10 +79,12 @@ def run_pipeline(
         )
         api_payload = detect_response.get_json() or {}
 
+    # 讀取資料庫資料
     with connect(db_path) as connection:
         users = fetch_all_users(connection)
         recent_visits = fetch_recent_visits(connection, user_id=api_payload.get("id"), limit=5)
 
+    # UI 訊息、促銷與儀表板
     detected_id = api_payload.get("id", "未知")
     confidence = float(api_payload.get("confidence", 0.0))
     messages = _build_messages(
@@ -100,6 +109,7 @@ def run_pipeline(
         db_path=db_path, output_path=output_dir / "admin_dashboard.html"
     )
 
+    # 總結
     duration_seconds = time.perf_counter() - start
     summary = {
         "camera": camera_metrics.to_dict(),
