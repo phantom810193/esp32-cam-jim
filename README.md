@@ -59,6 +59,16 @@
 2. 執行 `pytest` 驗證任務1~5指標。
 3. 生成測試報告與日誌檔供下載。
 
+> **合併前請確認**：GitHub Actions 的 "Lint GitHub Workflows / actionlint (validate workflow syntax)" 工作需成功通過，以確保 workflow 語法正確。
+
+## 貢獻指南
+
+維運須知：
+- 到 Settings → Branches → Branch protection rules（主分支）：
+  - 勾 **Require status checks to pass before merging**
+  - 加入必須通過的檢查：`Lint GitHub Workflows / actionlint (validate workflow syntax)`
+- 儲存設定。
+
 ## 任務說明與驗證指標
 
 | 任務 | 自動化腳本 | 驗證項目 | 對應 log |
