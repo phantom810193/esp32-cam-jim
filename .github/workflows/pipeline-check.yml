@@ -35,6 +35,13 @@ jobs:
           create_credentials_file: true
           export_environment_variables: true
 
+      - name: Export ADC env
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${{ steps.gcp-auth.outputs.credentials_file_path }}" >> "$GITHUB_ENV"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ steps.gcp-auth.outputs.credentials_file_path }}" >> "$GITHUB_ENV"
+
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
@@ -127,19 +134,23 @@ jobs:
             echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
-      - name: Fetch ID token for Cloud Run (via auth action)
+      - name: Get Cloud Run ID token (gcloud, no impersonation)
         id: idt
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SA_EMAIL }}
-          token_format: 'id_token'
-          audience: ${{ env.SERVICE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${SERVICE_URL%/}"
+          # 清掉可能殘留的 impersonation 設定
+          gcloud config unset auth/impersonate_service_account || true
+          echo "Active account:"; gcloud auth list --filter=status:ACTIVE
+          echo "ADC file: ${GOOGLE_APPLICATION_CREDENTIALS:-<none>}"
+          gcloud --version
+          # 關鍵：audience 必須是 Cloud Run 服務的根 URL（不含路徑）
+          IDT="$(gcloud auth print-identity-token --include-email --audiences="$BASE")"
+          echo "id_token=$IDT" >> "$GITHUB_OUTPUT"
 
       - name: Probe Cloud Run /health (no impersonation)
         shell: bash
-        env:
-          IDT: ${{ steps.idt.outputs.id_token }}
         run: |
           set -euo pipefail
           URL="${SERVICE_URL%/}${CLOUD_RUN_HEALTH_PATH:-/health}"
@@ -155,13 +166,29 @@ jobs:
           echo "GET (auth) $URL"
           n=0
           while :; do
-            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+            HTTP2=$(curl -sS -H "Authorization: Bearer ${{ steps.idt.outputs.id_token }}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
             echo "HTTP(auth)=$HTTP2"
             if [ "$HTTP2" -ge 200 ] && [ "$HTTP2" -lt 300 ]; then
               echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
               break
             fi
-            n=$((n+1)); [ $n -ge 5 ] && { echo "Health check failed after retries"; exit 1; }
+            n=$((n+1))
+            if [ $n -ge 5 ]; then
+              echo "Health check failed after retries; collecting diagnostics"
+              export IDT="${{ steps.idt.outputs.id_token }}"
+              gcloud info || true
+              gcloud config list || true
+              python3 - <<'PY'
+import os,sys,jwt
+import base64,json
+tok=os.environ.get("IDT")
+h=jwt.get_unverified_header(tok)
+p=jwt.decode(tok, options={"verify_signature":False})
+print("IDT.header=",h)
+print("IDT.payload=",json.dumps(p,indent=2))
+PY
+              exit 1
+            fi
             sleep 3
           done
 
