@@ -31,7 +31,6 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -43,7 +42,6 @@ jobs:
 
       - name: Detect tests
         id: detect
-        shell: bash
         run: |
           if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1; then
             echo "has_tests=1" >> "$GITHUB_OUTPUT"
@@ -60,33 +58,27 @@ jobs:
         run: echo "No test files detected; skipping pytest."
 
   pipeline-check:
-    # 若希望本地測試通過才跑，解開下一行
-    # needs: tests
+    # needs: tests   # 若要先跑本地測試再跑，移除註解
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      id-token: write   # OIDC
+      id-token: write
       contents: read
 
     env:
-      # -------- GCP 基本 --------
+      # ------- GCP 基本 -------
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
 
-      # -------- Cloud Run 服務（建議放在 repo → Settings → Variables → SERVICE_URL）--------
-      SERVICE_URL: ${{ vars.SERVICE_URL || 'https://esp32-cam-jim-665759721336.asia-east1.run.app' }}
-
-      # -------- Vertex Pipelines --------
-      PIPELINE_DEF: ${{ vars.PIPELINE_DEF || 'pipelines/face_enroll_recognize.json' }}
-      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT || 'gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root' }}
-
-      # -------- GCS 路徑（建議改成 Variables）--------
-      GCS_INBOX: ${{ vars.GCS_INBOX || 'gs://esp32cam-472912-faces/new_photos' }}
-      # 多人樣本根路徑：例如 gs://esp32cam-472912-vertex-data/faces/personA
-      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI || 'gs://esp32cam-472912-vertex-data/faces/personA' }}
+      # ------- 從 repo Variables 讀取（建議在 Settings → Secrets and variables → Actions → Variables 設定）-------
+      SERVICE_URL: ${{ vars.SERVICE_URL }}     # 例：https://esp32-cam-jim-665759721336.asia-east1.run.app
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }} # 例：gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root
+      GCS_INBOX: ${{ vars.GCS_INBOX }}         # 例：gs://esp32cam-472912-faces/new_photos
+      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://esp32cam-472912-vertex-data/faces/personA
+      PIPELINE_DEF: pipelines/face_enroll_recognize.json
 
     steps:
-      - name: Checkout (current branch files)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Auth to GCP via OIDC
@@ -100,16 +92,18 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Sanity check env
+      - name: Sanity check (required env/vars exist)
         run: |
-          echo "PROJECT_ID=${PROJECT_ID}"
-          echo "REGION=${REGION}"
+          set -e
+          : "${SERVICE_URL:?SERVICE_URL missing (set repo variable)}"
+          : "${PIPELINE_ROOT:?PIPELINE_ROOT missing (set repo variable)}"
+          : "${GCS_INBOX:?GCS_INBOX missing (set repo variable)}"
+          : "${SAMPLES_ROOT_URI:?SAMPLES_ROOT_URI missing (set repo variable)}"
+          test -f "${PIPELINE_DEF}" || (echo "Missing ${PIPELINE_DEF}" && exit 1)
           echo "SERVICE_URL=${SERVICE_URL}"
-          echo "PIPELINE_DEF=${PIPELINE_DEF}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
           echo "GCS_INBOX=${GCS_INBOX}"
           echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
-          test -f "${PIPELINE_DEF}" || (echo "❌ Missing ${PIPELINE_DEF}" && exit 1)
 
       - name: Run Vertex Pipeline (enroll batch)
         run: |
@@ -128,7 +122,6 @@ jobs:
           echo "JOB_ID=$JOB_ID"
           gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
 
-      # ====== 多人輪測：逐個子資料夾上傳 01.jpg 到 INBOX，觸發 Eventarc ======
       - name: Upload one test photo per person (trigger Eventarc)
         run: |
           set -e
@@ -139,10 +132,9 @@ jobs:
             ts=$(date +%s)
             dst="${GCS_INBOX%/}/ci_${person}_${ts}.jpg"
             echo "cp $src -> $dst"
-            gsutil cp "$src" "$dst" || echo "⚠️ 跳過：$src 不存在"
+            gsutil cp "$src" "$dst" || echo "Skip (no 01.jpg): $src"
           done
 
-      # ====== 多人輪測：逐人抓 02.jpg，呼叫 /detect_face ======
       - name: Recognize via API for each person
         run: |
           set -e
@@ -151,19 +143,18 @@ jobs:
             person=$(basename "${dir%/}")
             img="/tmp/02_${person}.jpg"
             if gsutil cp "${dir}02.jpg" "$img"; then
-              python3 - <<'PY' || fails=$((fails+1))
-import base64, json, os, urllib.request, sys
-img=sys.argv[1]; person=sys.argv[2]
+              IMG="$img" PERSON="$person" python3 - <<'PY' || fails=$((fails+1))
+import base64, json, os, urllib.request
+img=os.environ["IMG"]; person=os.environ["PERSON"]
 url=os.environ["SERVICE_URL"].rstrip("/") + "/detect_face"
-with open(img,"rb") as f: b64 = base64.b64encode(f.read()).decode()
+with open(img,"rb") as f: b64=base64.b64encode(f.read()).decode()
 payload=json.dumps({"images":[f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
 print("POST", url, "for", person)
 resp=urllib.request.urlopen(urllib.request.Request(url, data=payload, headers={"Content-Type":"application/json"}), timeout=120)
 print(resp.read().decode())
 PY
-              "$img" "$person"
             else
-              echo "⚠️ 跳過：${person} 無 02.jpg"
+              echo "Skip (no 02.jpg): ${person}"
             fi
           done
           echo "fails=$fails"
@@ -174,6 +165,5 @@ PY
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-check-artifacts
-          path: |
-            **/*.log
+          path: "**/*.log"
           if-no-files-found: ignore
