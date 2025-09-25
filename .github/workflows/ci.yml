@@ -78,7 +78,6 @@ jobs:
     env:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
-
       SERVICE_URL: ${{ vars.SERVICE_URL }}
       PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}
       GCS_INBOX: ${{ vars.GCS_INBOX }}
@@ -203,13 +202,17 @@ jobs:
         run: |
           set -euo pipefail
           BASE="${SERVICE_URL%/}"
-          # 防呆：確保沒有殘留 impersonation
+          # 清掉可能殘留的 impersonation 設定
           gcloud config unset auth/impersonate_service_account || true
           echo "Active account:"; gcloud auth list --filter=status:ACTIVE
           echo "ADC file: ${GOOGLE_APPLICATION_CREDENTIALS:-<none>}"
           gcloud --version
-          # 以 ADC 產生 Cloud Run 需要的 ID Token（audience=服務根網址）
-          IDT="$(gcloud auth application-default print-identity-token --audiences="$BASE")"
+          # 先用 ADC 取 ID Token；若該子命令不存在或失敗，改用 google-auth 備援
+          if IDT="$(gcloud auth application-default print-identity-token --audiences="$BASE" 2>/dev/null)"; then
+            :
+          else
+            IDT="$(python3 -c 'import os; from google.auth.transport.requests import Request; from google.oauth2.id_token import fetch_id_token; aud=os.environ["BASE"]; print(fetch_id_token(Request(), aud))')"
+          fi
           echo "id_token=$IDT" >> "$GITHUB_OUTPUT"
 
       - name: Probe Cloud Run /health (no impersonation)
@@ -242,13 +245,10 @@ jobs:
               gcloud info || true
               gcloud config list || true
               python3 - <<'PY'
-              import os,sys,jwt
-              import base64,json
-              tok=os.environ.get("IDT")
-              h=jwt.get_unverified_header(tok)
-              p=jwt.decode(tok, options={"verify_signature":False})
-              print("IDT.header=",h)
-              print("IDT.payload=",json.dumps(p,indent=2))
+                import os,sys,jwt,base64,json
+                tok=os.environ.get("IDT")
+                h=jwt.get_unverified_header(tok); p=jwt.decode(tok, options={"verify_signature":False})
+                print("IDT.header=",h); print("IDT.payload=",json.dumps(p,indent=2))
               PY
               exit 1
             fi
