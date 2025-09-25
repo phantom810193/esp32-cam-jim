@@ -6,11 +6,11 @@ on:
       - main
       - master
       - develop
+      - test
       - feature/**
   pull_request:
   workflow_dispatch: {}
 
-# 同一分支只保留最新一次執行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,7 +21,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-
     steps:
       - uses: actions/checkout@v4
 
@@ -60,133 +59,121 @@ jobs:
         if: steps.detect.outputs.has_tests != '1'
         run: echo "No test files detected; skipping pytest."
 
-  gcp-tests:
-    # 若希望部署前必須通過本地測試，可解除下一行註解：
+  pipeline-check:
+    # 若希望本地測試通過才跑，解開下一行
     # needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      id-token: write   # OIDC
       contents: read
 
     env:
-      # ---------- 常規設定 ----------
-      GCP_PROJECT:                 ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
-      CLOUD_RUN_URL:               ${{ vars.CLOUD_RUN_URL || secrets.CLOUD_RUN_URL }}
-      CLOUD_RUN_HEALTH_PATH:       ${{ vars.CLOUD_RUN_HEALTH_PATH || secrets.CLOUD_RUN_HEALTH_PATH || '/' }}
-      CLOUD_RUN_DETECT_PATH:       ${{ vars.CLOUD_RUN_DETECT_PATH || secrets.CLOUD_RUN_DETECT_PATH || '/detect_face' }}
-      FIRESTORE_COLLECTION:        ${{ vars.FIRESTORE_COLLECTION || secrets.FIRESTORE_COLLECTION || 'users' }}
-      FIRESTORE_EVENTS_COLLECTION: ${{ vars.FIRESTORE_EVENTS_COLLECTION || secrets.FIRESTORE_EVENTS_COLLECTION || 'visits' }}
-      FIRESTORE_DATABASE_ID:       ${{ vars.FIRESTORE_DATABASE_ID || secrets.FIRESTORE_DATABASE_ID || '(default)' }}
-      # ---------- 旗標 ----------
-      RUN_EMBED_TESTS: ${{ (vars.ENABLE_EMBEDDING == '1' || secrets.ENABLE_EMBEDDING == '1') && '1' || '0' }}
-      # ---------- 其他可調參數 ----------
-      SAMPLES_DIR:    ${{ vars.SAMPLES_DIR || secrets.SAMPLES_DIR || 'samples/faces/personA' }}
-      N_IMAGES:       ${{ vars.N_IMAGES || secrets.N_IMAGES || '0' }}
-      THRESHOLD:      ${{ vars.THRESHOLD || secrets.THRESHOLD || '0.8' }}
-      TARGET_ACC:     ${{ vars.TARGET_ACC || secrets.TARGET_ACC || '0.8' }}
-      BASELINE_INDEX: ${{ vars.BASELINE_INDEX || secrets.BASELINE_INDEX || '-1' }}
-      USE_VISION:     ${{ vars.USE_VISION || secrets.USE_VISION || '1' }}
+      # -------- GCP 基本 --------
+      PROJECT_ID: esp32cam-472912
+      REGION: asia-east1
+
+      # -------- Cloud Run 服務（建議放在 repo → Settings → Variables → SERVICE_URL）--------
+      SERVICE_URL: ${{ vars.SERVICE_URL || 'https://esp32-cam-jim-665759721336.asia-east1.run.app' }}
+
+      # -------- Vertex Pipelines --------
+      PIPELINE_DEF: ${{ vars.PIPELINE_DEF || 'pipelines/face_enroll_recognize.json' }}
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT || 'gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root' }}
+
+      # -------- GCS 路徑（建議改成 Variables）--------
+      GCS_INBOX: ${{ vars.GCS_INBOX || 'gs://esp32cam-472912-faces/new_photos' }}
+      # 多人樣本根路徑：例如 gs://esp32cam-472912-vertex-data/faces/personA
+      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI || 'gs://esp32cam-472912-vertex-data/faces/personA' }}
 
     steps:
-      - name: Check for GCP key (gate the job)
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        shell: bash
-        run: |
-          if [ -z "$GCP_SA_KEY" ]; then
-            echo "SKIP_GCP=1" >> "$GITHUB_ENV"
-            echo "### gcp-tests skipped: missing secrets.GCP_SA_KEY" >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Checkout (current branch files)
+        uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        if: env.SKIP_GCP != '1'
-
-      - name: Print resolved flags
-        if: env.SKIP_GCP != '1'
-        shell: bash
-        run: |
-          echo "RUN_EMBED_TESTS=$RUN_EMBED_TESTS"
-          echo "USE_VISION=$USE_VISION  N_IMAGES=$N_IMAGES  BASELINE_INDEX=$BASELINE_INDEX  THRESHOLD=$THRESHOLD  TARGET_ACC=$TARGET_ACC"
-
-      - name: Write GCP service account key
-        if: env.SKIP_GCP != '1'
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        shell: bash
-        run: |
-          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-key.json"
-          python - <<'PY'
-          import json, os
-          p = os.path.join(os.environ["RUNNER_TEMP"], "gcp-key.json")
-          json.load(open(p))
-          print("SA JSON OK:", p)
-          PY
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> "$GITHUB_ENV"
-
-      - name: Set up Python
-        if: env.SKIP_GCP != '1'
-        uses: actions/setup-python@v5
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
 
-      - name: Install base deps (Vision/Firestore/Auth/HTTP/Numpy)
-        if: env.SKIP_GCP != '1'
-        shell: bash
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Sanity check env
         run: |
-          python -m pip install --upgrade pip
-          pip install "google-auth[requests]" google-cloud-vision google-cloud-firestore requests numpy
+          echo "PROJECT_ID=${PROJECT_ID}"
+          echo "REGION=${REGION}"
+          echo "SERVICE_URL=${SERVICE_URL}"
+          echo "PIPELINE_DEF=${PIPELINE_DEF}"
+          echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
+          echo "GCS_INBOX=${GCS_INBOX}"
+          echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
+          test -f "${PIPELINE_DEF}" || (echo "❌ Missing ${PIPELINE_DEF}" && exit 1)
 
-      - name: Install optional embedding deps (OpenCV + dlib + face_recognition)
-        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1'
-        shell: bash
+      - name: Run Vertex Pipeline (enroll batch)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgl1
-          pip install pillow opencv-python "dlib==19.24.4" face_recognition face_recognition_models scikit-learn
+          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+            --region="${REGION}" \
+            --pipeline-definition-file="${PIPELINE_DEF}" \
+            --pipeline-root="${PIPELINE_ROOT}" \
+            --display-name="Enroll Batch via CI" \
+            --labels=ci=codex,stage=enroll \
+            --format="value(name)"
 
-      - name: Install project requirements if present
-        if: env.SKIP_GCP != '1'
-        shell: bash
+      - name: Wait for enroll to finish
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
+            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
+          echo "JOB_ID=$JOB_ID"
+          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
 
-      - name: Connectivity tests (Vision / Firestore / Cloud Run)
-        if: env.SKIP_GCP != '1' && hashFiles('scripts/gcp_connect_test.py') != ''
-        continue-on-error: true
-        run: python scripts/gcp_connect_test.py
-
-      - name: ID batch test (Vision+embedding)
-        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/id_batch_test.py') != ''
-        continue-on-error: true
-        run: python scripts/id_batch_test.py
-
-      - name: API latency test (/detect_face)
-        if: env.SKIP_GCP != '1' && env.RUN_EMBED_TESTS == '1' && hashFiles('scripts/post_detect_latency.py') != ''
-        continue-on-error: true
-        run: python scripts/post_detect_latency.py
-
-      - name: Fallback copy (ensure id_test.log exists)
-        if: env.SKIP_GCP != '1'
-        shell: bash
+      # ====== 多人輪測：逐個子資料夾上傳 01.jpg 到 INBOX，觸發 Eventarc ======
+      - name: Upload one test photo per person (trigger Eventarc)
         run: |
-          if [ -f integrated_test.log ] && [ ! -f id_test.log ]; then
-            cp integrated_test.log id_test.log
-          fi
+          set -e
+          echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
+          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
+            person=$(basename "${dir%/}")
+            src="${dir}01.jpg"
+            ts=$(date +%s)
+            dst="${GCS_INBOX%/}/ci_${person}_${ts}.jpg"
+            echo "cp $src -> $dst"
+            gsutil cp "$src" "$dst" || echo "⚠️ 跳過：$src 不存在"
+          done
 
-      - name: Upload logs
-        if: env.SKIP_GCP != '1' && always()
+      # ====== 多人輪測：逐人抓 02.jpg，呼叫 /detect_face ======
+      - name: Recognize via API for each person
+        run: |
+          set -e
+          fails=0
+          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
+            person=$(basename "${dir%/}")
+            img="/tmp/02_${person}.jpg"
+            if gsutil cp "${dir}02.jpg" "$img"; then
+              python3 - <<'PY' || fails=$((fails+1))
+import base64, json, os, urllib.request, sys
+img=sys.argv[1]; person=sys.argv[2]
+url=os.environ["SERVICE_URL"].rstrip("/") + "/detect_face"
+with open(img,"rb") as f: b64 = base64.b64encode(f.read()).decode()
+payload=json.dumps({"images":[f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
+print("POST", url, "for", person)
+resp=urllib.request.urlopen(urllib.request.Request(url, data=payload, headers={"Content-Type":"application/json"}), timeout=120)
+print(resp.read().decode())
+PY
+              "$img" "$person"
+            else
+              echo "⚠️ 跳過：${person} 無 02.jpg"
+            fi
+          done
+          echo "fails=$fails"
+          [ "$fails" -eq 0 ] || exit 1
+
+      - name: Upload logs (if any)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gcp-logs
+          name: pipeline-check-artifacts
           path: |
-            gcp_test.log
-            vision_test.log
-            firestore_test.log
-            cloudrun_test.log
-            integrated_test.log
-            id_test.log
-            api_test.log
-          if-no-files-found: warn
+            **/*.log
+          if-no-files-found: ignore
