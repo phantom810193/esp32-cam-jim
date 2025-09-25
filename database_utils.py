@@ -8,9 +8,54 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Any
 
-# ==== 路徑預設 ====
-DEFAULT_DB_PATH = Path("users.db")
+# ==== 預設檔案與 SQL 腳本位置 ====
+# Cloud Run 只有 /tmp 可寫，若無環境變數則落到 /tmp/face.db
 DEFAULT_SQL_PATH = Path(__file__).resolve().parent / "data.sql"
+
+
+# ---------------- 路徑解析 ----------------
+def _resolve_db_path() -> Path:
+    """
+    依序解析 DB_PATH / SQLITE_DB / SQLALCHEMY_DATABASE_URI，最終回傳純檔案路徑。
+    未設定時回傳 /tmp/face.db。
+    """
+    # 1) 明確檔案路徑環境變數
+    for key in ("DB_PATH", "SQLITE_DB"):
+        v = os.getenv(key)
+        if v and v.strip():
+            return Path(v.strip())
+
+    # 2) 從 SQLAlchemy URI 轉純檔案路徑
+    uri = os.getenv("SQLALCHEMY_DATABASE_URI", "").strip()
+    if uri.startswith("sqlite:"):
+        # 支援 sqlite:////abs/path.db 與 sqlite:///relative.db
+        if uri.startswith("sqlite:////"):
+            # sqlite:////tmp/face.db  -> /tmp/face.db
+            return Path(uri.replace("sqlite:////", "/", 1))
+        if uri.startswith("sqlite:///"):
+            # sqlite:///users.db -> users.db（相對路徑，之後會在當前工作目錄下）
+            return Path(uri.replace("sqlite:///", "", 1))
+        # 其他 sqlite: 變體（盡量剝掉前綴與查詢參數）
+        rest = uri[len("sqlite:") :]
+        # 處理 file: 路徑或帶參數的情況（不使用 sqlite3 的 URI 模式）
+        if rest.startswith("file:"):
+            rest = rest[len("file:") :]
+        if "?" in rest:
+            rest = rest.split("?", 1)[0]
+        return Path(rest.lstrip("/"))
+
+    # 3) 最終預設
+    return Path("/tmp/face.db")
+
+
+DB_FILE = _resolve_db_path()
+# 確保資料夾存在
+try:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # 若 parent 不存在且不可建立，交由後續連線報錯
+    pass
+
 
 # ==== 資料模型（沿用 codex 版欄位，對 Firestore 做相容轉換） ====
 @dataclass
@@ -77,7 +122,7 @@ def firestore_increment(n: int):
 
 # ---------------- 對外 API ----------------
 def initialize_database(
-    db_path: Path | str = DEFAULT_DB_PATH,
+    db_path: Path | str | None = None,
     sql_path: Path | str = DEFAULT_SQL_PATH,
     *,
     reset: bool = False,
@@ -89,8 +134,11 @@ def initialize_database(
     if _use_firestore():
         return
 
-    db_path = Path(db_path)
+    db_path = Path(db_path) if db_path is not None else DB_FILE
     sql_path = Path(sql_path)
+
+    # 目錄確保存在
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     if reset and db_path.exists():
         db_path.unlink(missing_ok=True)
@@ -102,7 +150,8 @@ def initialize_database(
     if sql_path.exists():
         script = sql_path.read_text(encoding="utf-8")
 
-    with sqlite3.connect(db_path) as connection:
+    # NOTE: 一律傳入「純字串檔案路徑」，不要傳 URI 給 sqlite3.connect
+    with sqlite3.connect(str(db_path)) as connection:
         if script.strip():
             connection.executescript(script)
         else:
@@ -130,7 +179,7 @@ def initialize_database(
 
 
 @contextmanager
-def connect(db_path: Path | str = DEFAULT_DB_PATH):
+def connect(db_path: Path | str | None = None):
     """
     提供 with connect(...) as conn: 使用
     - Firestore: 回傳 FirestoreConn
@@ -139,13 +188,30 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH):
     if _use_firestore():
         conn = FirestoreConn()
         yield conn
-    else:
-        connection = sqlite3.connect(Path(db_path))
-        connection.row_factory = sqlite3.Row
+        return
+
+    db_path = Path(db_path) if db_path is not None else DB_FILE
+    # 目錄確保存在（避免容器首次啟動時失敗）
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # sqlite3 需要純檔案路徑字串；給一些較保守的參數
+    connection = sqlite3.connect(
+        str(db_path),
+        timeout=float(os.getenv("SQLITE_TIMEOUT", "30")),
+        check_same_thread=False,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        # 輕量並發最佳化（可忽略失敗）
         try:
-            yield connection
-        finally:
+            connection.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        yield connection
+    finally:
+        try:
             connection.commit()
+        finally:
             connection.close()
 
 
