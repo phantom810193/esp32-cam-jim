@@ -1,16 +1,12 @@
-name: Vertex Pipeline - Enroll & Recognize Check
+name: Cloud – OIDC + Vertex Pipeline + Multi-face E2E
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-      - develop
-      - "codex/**"
+    branches: [ main, master, develop, "codex/**" ]
 
 permissions:
-  id-token: write
+  id-token: write   # ！！！OIDC 必須
   contents: read
 
 env:
@@ -18,76 +14,162 @@ env:
   REGION: asia-east1
   SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
 
-  # TODO: 改成你實際路徑/桶名
+  # === 若你要跑 Vertex Pipeline / Eventarc，請把兩個值改成真的 GCS 路徑 ===
   PIPELINE_DEF: pipelines/face_enroll_recognize.json
   PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
   GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
 
 jobs:
-  run-pipeline-and-verify:
+  run-pipeline-and-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 以 GitHub OIDC 扮演 GCP 服務帳號（無任何 JSON 金鑰）
       - name: Auth to GCP via OIDC
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Run Vertex Pipeline (enroll batch)
-        shell: bash
+      - name: Install tools
         run: |
           set -euo pipefail
-          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
-            --region="${REGION}" \
-            --pipeline-definition-file="${PIPELINE_DEF}" \
-            --pipeline-root="${PIPELINE_ROOT}" \
-            --display-name="Enroll Batch via CI" \
-            --labels=ci=codex,stage=enroll \
-            --format="value(name)"
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl python3
 
-      - name: Wait for enroll to finish
-        shell: bash
+      - name: Guard – warn if placeholders not replaced
         run: |
           set -euo pipefail
-          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
-            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
-          echo "JOB_ID=$JOB_ID"
-          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
+          echo "::group::Env summary"
+          env | sort
+          echo "::endgroup::"
+          if echo "${PIPELINE_ROOT}${GCS_INBOX}" | grep -q 'YOUR_'; then
+            echo "::warning::You are still using placeholder GCS paths. Vertex/Eventarc steps will be skipped."
+          fi
 
-      - name: Upload a test photo to trigger Eventarc
-        shell: bash
+      - name: Verify OIDC identity & basic perms
         run: |
           set -euo pipefail
-          echo "Uploading test image to ${GCS_INBOX}..."
-          gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
+          echo "== Active account =="
+          gcloud auth list
+          echo "== List Cloud Run services (${REGION}) =="
+          gcloud run services list --region="${REGION}" || exit 1
+          # 嘗試列出 Pipeline Root / Inbox 的 bucket（若為有效 gs://）
+          for uri in "${PIPELINE_ROOT}" "${GCS_INBOX}"; do
+            if echo "$uri" | grep -q '^gs://'; then
+              bucket="$(echo "$uri" | sed 's#^gs://\([^/]*\).*#\1#')"
+              echo "Try ls bucket: gs://${bucket}"
+              gsutil ls "gs://${bucket}" || echo "::warning::Cannot access bucket: ${bucket}"
+            fi
+          done
+
+      # ===== (可選) Vertex AI Pipeline：若檔案/路徑齊全才會執行 =====
+      - name: Run Vertex Pipeline (enroll batch) – conditional
+        id: run_pipeline
+        run: |
+          set -euo pipefail
+          if [ -f "${PIPELINE_DEF}" ] && echo "${PIPELINE_ROOT}" | grep -q '^gs://'; then
+            echo "Submitting Vertex pipeline..."
+            JOB_NAME=$(gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll \
+              --format="value(name)")
+            echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+            echo "Submitted: ${JOB_NAME}"
+          else
+            echo "Skip: PIPELINE_DEF not found or PIPELINE_ROOT not a gs:// path."
+          fi
+
+      - name: Wait for enroll to finish – conditional
+        if: steps.run_pipeline.outputs.job_name
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.run_pipeline.outputs.job_name }}"
+          echo "Waiting for ${JOB_NAME} ..."
+          gcloud ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
+
+      # ===== (可選) 透過上傳圖片觸發 Eventarc → Cloud Run （若 GCS_INBOX 有效）=====
+      - name: Upload a test photo to trigger Eventarc – conditional
+        run: |
+          set -euo pipefail
+          if echo "${GCS_INBOX}" | grep -q '^gs://'; then
+            mkdir -p /tmp/ci && cd /tmp/ci
+            curl -fsSLo face_trigger.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
+            gsutil cp face_trigger.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
+          else
+            echo "Skip: GCS_INBOX is not a valid gs:// path."
+          fi
 
       - name: Probe Cloud Run /health
-        shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${SERVICE_URL%/}/health"
+          curl -fsSL "${SERVICE_URL}/health"
 
-      - name: Recognize via API (existing face)
-        shell: bash
+      # ===== 黑箱 E2E：多人臉 Enroll(A/B) + Recognize(A) =====
+      - name: Smoke test – multi-person enroll & recognize
         run: |
           set -euo pipefail
-          python3 -c "import base64,json,os,urllib.request
-img='samples/faces/personA/02.jpg'
-b64=base64.b64encode(open(img,'rb').read()).decode()
-payload=json.dumps({'images':['data:image/jpeg;base64,'+b64],'purchase':'Milk'}).encode()
-service_url=os.environ['SERVICE_URL'].rstrip('/')+'/detect_face'
-req=urllib.request.Request(service_url,data=payload,headers={'Content-Type':'application/json'})
-print(urllib.request.urlopen(req,timeout=60).read().decode())"
+          mkdir -p /tmp/faces/A /tmp/faces/B
+          curl -fsSLo /tmp/faces/A/1.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
+          curl -fsSLo /tmp/faces/A/2.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0002.jpg
+          curl -fsSLo /tmp/faces/B/1.jpg https://vis-www.cs.umass.edu/lfw/images/Tony_Blair/Tony_Blair_0001.jpg
 
-      - name: (Optional) Assert Firestore writes (visits increment)
-        shell: bash
+          b64() { python3 - "$1" <<'PY'
+import sys, base64; print(base64.b64encode(open(sys.argv[1],'rb').read()).decode())
+PY
+          }
+          A1=$(b64 /tmp/faces/A/1.jpg)
+          A2=$(b64 /tmp/faces/A/2.jpg)
+          B1=$(b64 /tmp/faces/B/1.jpg)
+
+          echo "== Enroll A =="
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+            -H 'Content-Type: application/json' \
+            -d "{\"user_id\":\"test-A\",\"images\":[\"data:image/jpeg;base64,$A1\",\"data:image/jpeg;base64,$A2\"]}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
+          test "$CODE" -ge 200 -a "$CODE" -lt 300
+
+          echo "== Enroll B =="
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+            -H 'Content-Type: application/json' \
+            -d "{\"user_id\":\"test-B\",\"images\":[\"data:image/jpeg;base64,$B1\"]}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
+          test "$CODE" -ge 200 -a "$CODE" -lt 300
+
+          echo "== Recognize A (should match test-A) =="
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/detect_face" \
+            -H 'Content-Type: application/json' \
+            -d "{\"images\":[\"data:image/jpeg;base64,$A1\"],\"purchase\":\"Milk\"}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
+          test "$CODE" -ge 200 -a "$CODE" -lt 300
+          # 你的 API 欄位可能不同：容錯式判定
+          if ! echo "$BODY" | jq -e '.user_id=="test-A" or .match_user=="test-A" or .is_same_person==true' >/dev/null; then
+            echo "::error::Expect a positive match for person A"; exit 1; fi
+
+      # ===== 用審計日誌證明真的走 OIDC（無金鑰）=====
+      - name: Prove OIDC in Audit Logs (last 60m)
         run: |
-          echo "若有 /debug 端點可在此查驗；否則改查雲端日誌或 Firestore。"
+          set -euo pipefail
+          PROJECT_NUM=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+          gcloud logging read \
+            'resource.type="audited_resource"
+             AND protoPayload.methodName="google.iam.credentials.v1.IAMCredentials.GenerateAccessToken"' \
+            --freshness=60m --limit=20 --format=json \
+          | jq -r '.[].protoPayload.authenticationInfo.principalSubject' \
+          | tee /tmp/subjects.txt
+          echo "Look for principal://iam.googleapis.com/projects/${PROJECT_NUM}/locations/global/workloadIdentityPools/..."
+          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "✅ Found OIDC principal" || (echo "::warning::No OIDC principal found"; exit 1)
