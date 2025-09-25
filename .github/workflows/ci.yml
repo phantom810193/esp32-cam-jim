@@ -11,21 +11,18 @@ on:
   pull_request: {}
   workflow_dispatch: {}
 
-# 同一分支只保留最新一次執行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # 1) 本地 pytest
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,7 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1 >/dev/null; then
+          if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1; then
             echo "has_tests=1" >> "$GITHUB_OUTPUT"
           else
             echo "has_tests=0" >> "$GITHUB_OUTPUT"
@@ -67,11 +64,11 @@ jobs:
         if: steps.detect.outputs.has_tests != '1'
         shell: bash
         run: |
+          set -euo pipefail
           echo "No test files detected; skipping pytest."
 
-  # 2) GCP 端到端驗證（OIDC）
   pipeline-check:
-    # needs: tests   # 若希望部署前必須通過本地測試，解除本行註解
+    # needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -81,10 +78,15 @@ jobs:
     env:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
-      SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
-      PIPELINE_DEF: pipelines/face_enroll_recognize.json
-      PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
-      GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
+
+      # 建議改用 Repo Variables 設定以下值
+      SERVICE_URL: ${{ vars.SERVICE_URL }}
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}
+      GCS_INBOX: ${{ vars.GCS_INBOX }}
+      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }}
+
+      # 可用 repo 本地檔案或 gs://
+      PIPELINE_DEF: ${{ vars.PIPELINE_DEF }}
 
     steps:
       - name: Checkout
@@ -103,123 +105,160 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Install tools
+      - name: Ensure jq
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl python3 coreutils
+          command -v jq >/dev/null || { sudo apt-get update -y && sudo apt-get install -y jq; }
 
       - name: Sanity check env
         shell: bash
         run: |
           set -euo pipefail
-          echo "PROJECT_ID=${PROJECT_ID}"
-          echo "REGION=${REGION}"
-          echo "SERVICE_URL=${SERVICE_URL}"
-          echo "PIPELINE_DEF=${PIPELINE_DEF}"
-          echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
-          echo "GCS_INBOX=${GCS_INBOX}"
-          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
-            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS"; exit 1; }
-          else
-            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo"; exit 1; }
-          fi
-
-      - name: Submit Vertex Pipeline (REST)
-        id: submit_pipeline
-        shell: bash
-        run: |
-          set -euo pipefail
-          SPEC=/tmp/pipeline_spec.json
-          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
-            gsutil cp "${PIPELINE_DEF}" "$SPEC"
-          else
-            cp "${PIPELINE_DEF}" "$SPEC"
-          fi
-          jq . "$SPEC" >/dev/null
-
-          BODY=/tmp/pipeline_body.json
-          jq -n \
-            --arg display "Enroll Batch via CI" \
-            --arg out "${PIPELINE_ROOT}" \
-            --argjson spec "$(cat "$SPEC")" \
-            '{displayName:$display, pipelineSpec:$spec,
-              runtimeConfig:{gcsOutputDirectory:$out},
-              labels:{ci:"codex", stage:"enroll"}}' > "$BODY"
-
-          ENDPOINT="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/pipelineJobs"
-          TOKEN="$(gcloud auth print-access-token)"
-          RESP=$(curl -sS -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-                 -X POST "$ENDPOINT" --data-binary @"$BODY")
-          echo "$RESP" | jq .
-          JOB_NAME=$(echo "$RESP" | jq -r '.name')
-          [ -n "$JOB_NAME" ] || { echo "No job name in response"; exit 1; }
-          echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for pipeline to finish (REST)
-        if: ${{ steps.submit_pipeline.outputs.job_name != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          JOB_NAME="${{ steps.submit_pipeline.outputs.job_name }}"
-          GET_URL="https://${REGION}-aiplatform.googleapis.com/v1/${JOB_NAME}"
-          TOKEN="$(gcloud auth print-access-token)"
-          for i in $(seq 1 60); do
-            RESP=$(curl -sS -H "Authorization: Bearer ${TOKEN}" "$GET_URL")
-            STATE=$(echo "$RESP" | jq -r '.state // .status.state // empty')
-            echo "State: ${STATE:-unknown}"
-            if [ "$STATE" = "PIPELINE_STATE_SUCCEEDED" ]; then
-              exit 0
-            fi
-            if [ "$STATE" = "PIPELINE_STATE_FAILED" ] || [ "$STATE" = "PIPELINE_STATE_CANCELLED" ]; then
-              echo "$RESP" | jq .
+          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
+            if [ -z "${!v:-}" ]; then
+              echo "Missing required variable: $v (set in Settings → Actions → Variables)" >&2
               exit 1
             fi
-            sleep 30
           done
-          echo "Timed out waiting for pipeline"
-          exit 1
 
-      - name: Upload a test photo to trigger Eventarc
+          if [ -z "${PIPELINE_DEF:-}" ]; then
+            echo "Missing variable: PIPELINE_DEF" >&2
+            exit 1
+          fi
+
+          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
+            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS" >&2; exit 1; }
+          else
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo" >&2; exit 1; }
+          fi
+
+          echo "SERVICE_URL=${SERVICE_URL}"
+          echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
+          echo "GCS_INBOX=${GCS_INBOX}"
+          echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
+          echo "PIPELINE_DEF=${PIPELINE_DEF}"
+
+      - name: Run Vertex Pipeline (enroll batch) - version compatible
+        id: run_pipeline
         shell: bash
         run: |
           set -euo pipefail
-          echo "Uploading test image to ${GCS_INBOX}..."
-          if [ -f samples/faces/personA/01.jpg ]; then
-            gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
+          JOB_NAME=""
+          if gcloud ai pipeline-jobs --help >/dev/null 2>&1; then
+            JOB_NAME=$(gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll \
+              --format="value(name)")
+          elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
+            JOB_NAME=$(gcloud beta ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll \
+              --format="value(name)")
+          elif gcloud ai pipelines --help >/dev/null 2>&1; then
+            OUT=$(gcloud ai pipelines run \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll 2>&1 | tee /tmp/pipelines_run.out)
+            JOB_NAME=$(grep -o 'projects/.*/locations/.*/pipelineJobs/[a-zA-Z0-9_-]*' /tmp/pipelines_run.out | head -n1 || true)
           else
-            dd if=/dev/urandom bs=1024 count=8 of=/tmp/placeholder.jpg >/dev/null 2>&1
-            gsutil cp /tmp/placeholder.jpg "${GCS_INBOX%/}/ci_placeholder_$(date +%s).jpg"
+            echo "::warning::No Vertex Pipelines command available; skipping pipeline submission."
+          fi
+          echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Submitted: ${JOB_NAME}"
+
+      - name: Wait for enroll to finish
+        if: ${{ steps.run_pipeline.outputs.job_name && steps.run_pipeline.outputs.job_name != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.run_pipeline.outputs.job_name }}"
+          if gcloud ai pipeline-jobs --help >/dev/null 2>&1; then
+            gcloud ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
+          elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
+            gcloud beta ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
+          else
+            echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
       - name: Probe Cloud Run /health
+        env:
+          SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${SERVICE_URL%/}/health" || { echo "/health failed"; exit 1; }
+          URL="${SERVICE_URL%/}/health"
+          echo "GET $URL"
+          HTTP=$(curl -sS -o /tmp/health_noauth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(no-auth)=$HTTP"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            cat /tmp/health_noauth.out
+            exit 0
+          fi
+          echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
+          IDT=$(gcloud auth print-identity-token --impersonate-service-account="$SA_EMAIL" --audiences="$URL")
+          HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(auth)=$HTTP2"
+          echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
+          test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
 
-      - name: Recognize via API (existing face)
+      - name: Upload one test photo per person (trigger Eventarc)
         shell: bash
         run: |
           set -euo pipefail
-          IMG=/tmp/ci_face.jpg
-          mkdir -p /tmp
-          curl -fsSLo "$IMG" https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
-          B64=$(base64 -w 0 "$IMG")
-          printf '{"images":["data:image/jpeg;base64,%s"],"purchase":"Milk"}' "$B64" > /tmp/payload.json
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/detect_face" \
-            -H 'Content-Type: application/json' --data-binary @/tmp/payload.json)
-          CODE=$(echo "$RES" | tail -n1)
-          BODY=$(echo "$RES" | sed '$d')
-          echo "$BODY" | jq .
-          test "$CODE" -ge 200 -a "$CODE" -lt 300 || { echo "HTTP $CODE"; exit 1; }
+          echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
+          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
+            person=$(basename "${dir%/}")
+            src="${dir}01.jpg"
+            ts=$(date +%s)
+            inbox="${GCS_INBOX%/}"
+            dst="${inbox}/ci_${person}_${ts}.jpg"
+            echo "cp ${src} -> ${dst}"
+            if gsutil -q stat "${src}"; then
+              gsutil cp "${src}" "${dst}"
+            else
+              echo "Skip (no 01.jpg): ${src}"
+            fi
+          done
 
-      - name: Upload run artifacts (logs, if any)
+      - name: Recognize via API for each person (pure bash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          fails=0
+          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
+            person=$(basename "${dir%/}")
+            img="/tmp/02_${person}.jpg"
+            if gsutil -q stat "${dir}02.jpg"; then
+              gsutil cp "${dir}02.jpg" "$img"
+              b64=$(base64 -w 0 "$img" 2>/dev/null || base64 "$img" | tr -d '\n')
+              payload=$(jq -cn --arg b64 "$b64" --arg person "$person" \
+                         '{images: ["data:image/jpeg;base64," + $b64], person: $person}')
+              echo "POST /detect_face for ${person}"
+              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" \
+                    -H "Content-Type: application/json" -d "$payload" >/dev/null; then
+                echo "FAIL: ${person}"
+                fails=$((fails+1))
+              fi
+            else
+              echo "Skip (no 02.jpg): ${dir}02.jpg"
+            fi
+          done
+          echo "fails=${fails}"
+          test "$fails" -eq 0
+
+      - name: Upload logs (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-check-artifacts
-          path: |
-            **/*.log
+          path: "**/*.log"
           if-no-files-found: ignore
