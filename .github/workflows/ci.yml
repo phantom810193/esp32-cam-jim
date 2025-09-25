@@ -203,13 +203,13 @@ jobs:
         run: |
           set -euo pipefail
           BASE="${SERVICE_URL%/}"
-          # 清掉可能殘留的 impersonation 設定
+          # 防呆：確保沒有殘留 impersonation
           gcloud config unset auth/impersonate_service_account || true
           echo "Active account:"; gcloud auth list --filter=status:ACTIVE
           echo "ADC file: ${GOOGLE_APPLICATION_CREDENTIALS:-<none>}"
           gcloud --version
-          # 關鍵：audience 必須是 Cloud Run 服務的根 URL（不含路徑）
-          IDT="$(gcloud auth print-identity-token --include-email --audiences="$BASE")"
+          # 以 ADC 產生 Cloud Run 需要的 ID Token（audience=服務根網址）
+          IDT="$(gcloud auth application-default print-identity-token --audiences="$BASE")"
           echo "id_token=$IDT" >> "$GITHUB_OUTPUT"
 
       - name: Probe Cloud Run /health (no impersonation)

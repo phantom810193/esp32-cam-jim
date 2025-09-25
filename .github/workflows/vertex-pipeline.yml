@@ -91,7 +91,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-          install_components: 'beta alpha'
+          install_components: "beta,alpha"
 
       - name: Configure workflow variables
         run: |
