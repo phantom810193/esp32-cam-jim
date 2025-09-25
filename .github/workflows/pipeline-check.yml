@@ -1,0 +1,79 @@
+name: Vertex Pipeline - Enroll & Recognize Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master, develop, "codex/**" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: esp32cam-472912
+  REGION: asia-east1
+  SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
+
+  # TODO: 請改成你實際路徑/桶名
+  PIPELINE_DEF: pipelines/face_enroll_recognize.json
+  PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
+  GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
+
+jobs:
+  run-pipeline-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Run Vertex Pipeline (enroll batch)
+        run: |
+          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+            --region="${REGION}" \
+            --pipeline-definition-file="${PIPELINE_DEF}" \
+            --pipeline-root="${PIPELINE_ROOT}" \
+            --display-name="Enroll Batch via CI" \
+            --labels=ci=codex,stage=enroll \
+            --format="value(name)"
+
+      - name: Wait for enroll to finish
+        run: |
+          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
+            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
+          echo "JOB_ID=$JOB_ID"
+          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
+
+      - name: Upload a test photo to trigger Eventarc
+        run: |
+          echo "Uploading test image to ${GCS_INBOX}..."
+          gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX}/ci_test_$(date +%s).jpg"
+
+      - name: Probe Cloud Run /health
+        run: |
+          curl -fsSL "${SERVICE_URL}/health"
+
+      - name: Recognize via API (existing face)
+        run: |
+          python3 - <<'PY'
+import base64, json, os, urllib.request
+img = "samples/faces/personA/02.jpg"
+b64 = base64.b64encode(open(img,"rb").read()).decode()
+payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "purchase":"Milk"}).encode()
+req = urllib.request.Request(os.environ["SERVICE_URL"]+"/detect_face", data=payload, headers={"Content-Type":"application/json"})
+resp = urllib.request.urlopen(req, timeout=60)
+print(resp.read().decode())
+PY
+      - name: (Optional) Assert Firestore writes (visits increment)
+        run: |
+          echo "若有 /debug 端點可在此查驗；否則改查雲端日誌或 Firestore。"
