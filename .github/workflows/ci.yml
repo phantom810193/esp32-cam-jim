@@ -207,11 +207,13 @@ jobs:
           echo "Active account:"; gcloud auth list --filter=status:ACTIVE
           echo "ADC file: ${GOOGLE_APPLICATION_CREDENTIALS:-<none>}"
           gcloud --version
+
           # 先用 ADC 取 ID Token；若該子命令不存在或失敗，改用 google-auth 備援
           if IDT="$(gcloud auth application-default print-identity-token --audiences="$BASE" 2>/dev/null)"; then
             :
           else
-            IDT="$(python3 -c 'import os; from google.auth.transport.requests import Request; from google.oauth2.id_token import fetch_id_token; aud=os.environ["BASE"]; print(fetch_id_token(Request(), aud))')"
+            python3 -m pip install --quiet --upgrade google-auth
+            IDT="$(BASE="$BASE" python3 -c 'from google.auth.transport.requests import Request; from google.oauth2.id_token import fetch_id_token; import os; aud = os.environ["BASE"]; print(fetch_id_token(Request(), aud))')"
           fi
           echo "id_token=$IDT" >> "$GITHUB_OUTPUT"
 
