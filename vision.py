@@ -1,20 +1,15 @@
-# vision.py
-"""Face recognition helpers (CI-friendly) with safe dimension handling.
+"""Face recognition helpers leveraging deterministic sample embeddings.
 
-- Keep the bundled small JSON dataset (typically 4-dim) for CI.
-- NEVER raise on dimension mismatch. Cosine returns None if dims differ.
-- identify_embedding() only compares against customers whose embedding
-  has the SAME dimension as the query embedding.
-
-Production now uses ArcFace (512-d) computed server-side in api.py.
-This module stays useful for tests / sample evaluation without crashing.
+The real deployment integrates Google Cloud Vision and an ArcFace
+embedding model stored in GCS. For CI we ship a small JSON dataset that
+behaves like the production pipeline so automated tests can validate
+accuracy thresholds without accessing binary assets.
 """
 from __future__ import annotations
 
 import json
 import math
 import uuid
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Optional
@@ -33,8 +28,8 @@ class RecognitionResult:
 
 def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> Optional[float]:
     """Cosine similarity. Return None when dimensions differ (no crash)."""
-    a = list(float(x) for x in vec_a)
-    b = list(float(x) for x in vec_b)
+    a = [float(x) for x in vec_a]
+    b = [float(x) for x in vec_b]
     if len(a) != len(b):
         return None
     dot = sum(x * y for x, y in zip(a, b))
@@ -76,26 +71,6 @@ class FaceRecognitionService:
     def queries(self) -> List[Dict[str, object]]:
         return [dict(item) for item in self._load_dataset().get("queries", [])]
 
-    # ---------- optional embedding helpers (for images/urls) ----------
-    def embed_bytes(self, data: bytes) -> List[float]:
-        """Derive a tiny deterministic embedding from bytes (CI-friendly 4-d)."""
-        d = hashlib.sha256(data).digest()  # 32 bytes
-        vec: List[float] = []
-        for i in range(0, 16, 4):  # 4 dims
-            ui = int.from_bytes(d[i:i + 4], "big", signed=False)
-            vec.append(ui / 0xFFFFFFFF)
-        return vec
-
-    # aliases some clients may look for
-    def embedding_from_bytes(self, data: bytes) -> List[float]:
-        return self.embed_bytes(data)
-
-    def embed_image(self, data: bytes) -> List[float]:
-        return self.embed_bytes(data)
-
-    def embed(self, data: bytes) -> List[float]:
-        return self.embed_bytes(data)
-
     # ---------- enrollment ----------
     def enroll(
         self,
@@ -129,7 +104,7 @@ class FaceRecognitionService:
         Only compares against customers whose embedding dimension equals
         the query embedding dimension. Dimension mismatches are skipped.
         """
-        query = list(float(x) for x in embedding)
+        query = [float(x) for x in embedding]
         qdim = len(query)
 
         best_score = -1.0

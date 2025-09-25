@@ -21,6 +21,7 @@ class UserRecord:
     last_purchase: str
     total_spend: float
 
+
 @dataclass
 class VisitRecord:
     id: int
@@ -30,6 +31,7 @@ class VisitRecord:
     spend: float
     source: str
 
+
 # ==== 後端判斷 ====
 def _use_firestore() -> bool:
     return (
@@ -37,6 +39,7 @@ def _use_firestore() -> bool:
         or bool(os.getenv("FIRESTORE_DATABASE_ID"))
         or bool(os.getenv("FIRESTORE_COLLECTION"))
     )
+
 
 # ---- Firestore 連線包裝 ----
 class FirestoreConn:
@@ -52,8 +55,7 @@ class FirestoreConn:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # 不吃掉例外
-        return False
+        return False  # 不吃掉例外
 
     # helpers
     def users(self):
@@ -61,6 +63,7 @@ class FirestoreConn:
 
     def events(self):
         return self.client.collection(self.events_name)
+
 
 # Firestore 的遞增 helper
 def firestore_increment(n: int):
@@ -70,6 +73,7 @@ def firestore_increment(n: int):
     except Exception:
         # 沒有 Increment 類別時，呼叫端仍會 set(merge=True)，此回傳僅為介面相容
         return n
+
 
 # ---------------- 對外 API ----------------
 def initialize_database(
@@ -124,6 +128,7 @@ def initialize_database(
             )
         connection.commit()
 
+
 @contextmanager
 def connect(db_path: Path | str = DEFAULT_DB_PATH):
     """
@@ -143,6 +148,7 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH):
             connection.commit()
             connection.close()
 
+
 # ---- 內部工具（SQLite）----
 def _record_visit_row(
     connection: sqlite3.Connection,
@@ -157,6 +163,7 @@ def _record_visit_row(
         "INSERT INTO visits(user_id, visit_time, purchase, spend, source) VALUES (?, ?, ?, ?, ?)",
         (user_id, visit_time, purchase, float(spend), source),
     )
+
 
 # ---- 建立新用戶 ----
 def create_user_record(
@@ -207,6 +214,7 @@ def create_user_record(
         source=source,
     )
 
+
 # ---- 記錄返店/消費 ----
 def record_visit(
     connection: Any,
@@ -254,6 +262,7 @@ def record_visit(
         source=source,
     )
 
+
 # ---- 查單一使用者 ----
 def get_user(connection: Any, user_id: str) -> Optional[UserRecord]:
     if isinstance(connection, FirestoreConn):
@@ -280,6 +289,7 @@ def get_user(connection: Any, user_id: str) -> Optional[UserRecord]:
         last_purchase=row["last_purchase"],
         total_spend=float(row["total_spend"]),
     )
+
 
 # ---- 取全部使用者（供 UI 顯示） ----
 def fetch_all_users(connection: Any) -> List[UserRecord]:
@@ -313,6 +323,7 @@ def fetch_all_users(connection: Any) -> List[UserRecord]:
         )
         for row in cursor.fetchall()
     ]
+
 
 # ---- 取近期事件 ----
 def fetch_recent_visits(
@@ -361,12 +372,14 @@ def fetch_recent_visits(
         for row in cursor.fetchall()
     ]
 
+
 # ---- 輔助 ----
 def to_rows(records: Iterable[UserRecord]) -> List[tuple]:
     return [
         (r.id, r.created_at, r.last_visit, r.last_purchase, r.total_spend)
         for r in records
     ]
+
 
 __all__ = [
     "UserRecord",

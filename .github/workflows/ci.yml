@@ -2,12 +2,16 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    branches:
+      - main
+      - master
+      - develop
+      - feature/**
   pull_request:
   workflow_dispatch: {}
 
 jobs:
-  unit-tests:
+  tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -30,7 +34,7 @@ jobs:
           fi
           pip install pytest
 
-      - name: Run pytest (unit only; ignore integration scripts)
+      - name: Run pytest
         run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
 
   gcp-tests:

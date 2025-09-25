@@ -1,4 +1,4 @@
-# api.py
+"""Flask application exposing enrollment and recognition endpoints."""
 from __future__ import annotations
 
 import json
@@ -6,183 +6,232 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 from flask import Flask, jsonify, request
 
-# ArcFace(512-d) server-side embedding + Vertex AI Vector Search
-from embedding_arcface import embed as arcface_embed
-from vertex_search import upsert as vs_upsert, query as vs_query
+from database_utils import (
+    connect,
+    create_user_record,
+    fetch_all_users,
+    fetch_recent_visits,
+    get_user,
+    initialize_database,
+    record_visit,
+)
+from vision import FaceRecognitionService
 
-THRESHOLD: float = float(os.getenv("THRESHOLD", "0.80"))
-API_LOG: Path = Path(os.getenv("API_LOG_PATH", "api_test.log"))
-ARCFACE_DIM: int = 512
+# ---- Optional ArcFace image embedding (server-side) ----
+_ARCFACE_AVAILABLE = False
+_ARCFACE_DIM = 512
+try:
+    from embedding_arcface import embed as arcface_embed  # type: ignore
+    _ARCFACE_AVAILABLE = True
+except Exception:
+    _ARCFACE_AVAILABLE = False
 
 
-# --------------- small helpers ---------------
 def _append_json_line(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as h:
-        h.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _avg(vectors: List[List[float]]) -> List[float]:
     import numpy as np
-    arr = np.array(vectors, dtype="float32")
+
+    arr = np.asarray(vectors, dtype="float32")
     v = arr.mean(axis=0)
     n = float((v**2).sum() ** 0.5) + 1e-9
     return (v / n).astype("float32").tolist()
 
 
-def _ensure_dim(vec: List[float], dim: int = ARCFACE_DIM) -> Tuple[bool, str]:
-    if not isinstance(vec, (list, tuple)):
-        return False, "embedding must be a list"
-    if len(vec) != dim:
-        return False, f"embedding length must be {dim}, got {len(vec)}"
-    return True, ""
-
-
 def _to_arcface_vector_from_image_payload(img_payload: Any) -> List[float]:
-    """
-    Accepts:
-      - data URI string (data:image/...;base64,...)
-      - raw base64 string (…==)
-      - bytes (already decoded)
-    Returns ArcFace(512) as list[float]
-    """
+    if not _ARCFACE_AVAILABLE:
+        raise RuntimeError("arcface embedding not available")
     vec = arcface_embed(img_payload)
-    # arcface_embed 會回 numpy.ndarray；轉為 list 並檢核維度
     if hasattr(vec, "tolist"):
         vec = vec.tolist()
-    ok, msg = _ensure_dim(vec, ARCFACE_DIM)
-    if not ok:
-        raise ValueError(msg)
+    if not isinstance(vec, (list, tuple)) or len(vec) != _ARCFACE_DIM:
+        raise ValueError(f"embedding length must be {_ARCFACE_DIM}")
     return [float(x) for x in vec]
 
 
-# --------------- Flask app ---------------
+def _resolve_embeddings(payload: Dict[str, Any]) -> List[Iterable[float]]:
+    embeddings = payload.get("embeddings")
+    if embeddings is None:
+        single = payload.get("embedding")
+        if single is not None:
+            embeddings = [single]
+        else:
+            images = payload.get("images")
+            if images:
+                # Compute embeddings on server if available
+                embs = [_to_arcface_vector_from_image_payload(img) for img in images]
+                embeddings = embs
+    if not embeddings:
+        raise ValueError("missing embeddings")
+    return list(embeddings)
+
+
+def _resolve_single_embedding(payload: Dict[str, Any]) -> List[float]:
+    """For /detect_face: accept 'embedding' or single 'image'/'images'."""
+    if "embedding" in payload:
+        return list(payload["embedding"])
+    img = payload.get("image")
+    if img is None:
+        imgs = payload.get("images") or []
+        img = imgs[0] if imgs else None
+    if img is not None:
+        return _to_arcface_vector_from_image_payload(img)
+    raise ValueError("missing embedding")
+
+
 def create_app(config: Dict[str, Any] | None = None) -> Flask:
+    config = config or {}
     app = Flask(__name__)
-    if config:
-        app.config.update(config)
+
+    db_path = Path(config.get("DB_PATH", "users.db"))
+    sql_path = Path(config.get("SQL_PATH", Path(__file__).resolve().parent / "data.sql"))
+    api_log_path = Path(config.get("API_LOG_PATH", "api_test.log"))
+    recognition_threshold = float(config.get("THRESHOLD", os.getenv("THRESHOLD", 0.8)))
+
+    app.config.update(
+        DB_PATH=str(db_path),
+        SQL_PATH=str(sql_path),
+        API_LOG_PATH=str(api_log_path),
+        THRESHOLD=recognition_threshold,
+    )
+
+    initialize_database(db_path, sql_path, reset=config.get("RESET_DB", False))
+    face_service = FaceRecognitionService(threshold=recognition_threshold)
+
+    def _log_and_response(payload: Dict[str, Any], *, endpoint: str, status_code: int = 200):
+        log_entry = {"endpoint": endpoint, "status": "ok", **payload}
+        _append_json_line(Path(app.config["API_LOG_PATH"]), log_entry)
+        return jsonify(payload), status_code
 
     @app.get("/health")
-    def health():
+    def health() -> Any:
         return jsonify({"ok": True, "time": datetime.now(UTC).isoformat()})
 
     @app.post("/enroll")
-    def enroll():
-        """
-        首次：images[]=dataURI（建議 3~5 張，多角度）+ purchase(optional)
-        - 忽略任何 client 端的 embedding，統一由伺服器 ArcFace(512) 計算
-        - 代表向量採 L2-normalized average
-        """
-        t0 = time.perf_counter()
+    def enroll() -> Any:
+        start = time.perf_counter()
         try:
-            p = request.get_json(force=True) or {}
-            images = p.get("images") or []
-            if not images:
-                return jsonify({"error": "no images"}), 400
+            payload = request.get_json(force=True) or {}
+            embeddings = _resolve_embeddings(payload)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
 
-            embs: List[List[float]] = []
-            for img in images:
-                e = _to_arcface_vector_from_image_payload(img)
-                embs.append(e)
+        purchase = payload.get("purchase", "Milk")
+        timestamp = payload.get("timestamp") or datetime.now(UTC).isoformat()
+        spend = float(payload.get("spend", 100.0))
+        requested_id = payload.get("id")
 
-            user_id = p.get("id") or f"ID-{int(time.time())}"
-            rep = _avg(embs)  # 代表向量
-            vs_upsert(user_id, [rep])  # Vertex AI Vector Search
+        enrollment = face_service.enroll(embeddings, user_id=requested_id)
+        resolved_id = enrollment["id"]
+        with connect(app.config["DB_PATH"]) as connection:
+            record = get_user(connection, resolved_id)
+            if record is None:
+                create_user_record(
+                    connection,
+                    user_id=resolved_id,
+                    created_at=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="enroll",
+                )
+                message = "新用戶已建檔"
+            else:
+                record_visit(
+                    connection,
+                    user_id=resolved_id,
+                    visit_time=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="enroll",
+                )
+                message = "使用者已存在，已更新影像"
+            recent_visits = fetch_recent_visits(connection, user_id=resolved_id, limit=5)
 
-            payload = {
-                "id": user_id,
-                "message": "新用戶已建檔",
-                "promotion": f"首次來店，{p.get('purchase','Milk')} 9折！",
-                "embeddings": len(embs),
-                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
-            }
-            _append_json_line(API_LOG, {"endpoint": "/enroll", "status": "ok", **payload})
-            return jsonify(payload)
-
-        except Exception as e:
-            err = {
-                "endpoint": "/enroll",
-                "status": "error",
-                "error": str(e),
-                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
-            }
-            _append_json_line(API_LOG, err)
-            return jsonify({"error": str(e)}), 400
+        duration_ms = (time.perf_counter() - start) * 1000
+        response_payload = {
+            "id": resolved_id,
+            "message": message,
+            "timestamp": timestamp,
+            "embeddings_registered": len(enrollment["embeddings"]),
+            "visit_count": len(recent_visits),
+            "duration_ms": duration_ms,
+            "visits": [visit.__dict__ for visit in recent_visits],
+        }
+        status_code = 201 if message == "新用戶已建檔" else 200
+        return _log_and_response(response_payload, endpoint="/enroll", status_code=status_code)
 
     @app.post("/detect_face")
-    def detect_face():
-        """
-        返店：
-          - 建議送 image（單張 dataURI）→ 伺服器端 ArcFace(512) 計算
-          - 亦可送 embedding（list[float]，長度必須 512）
-        回傳：
-          id / confidence / new_user / message / promotion
-        """
-        t0 = time.perf_counter()
+    def detect_face() -> Any:
+        start = time.perf_counter()
         try:
-            p = request.get_json(force=True) or {}
+            payload = request.get_json(force=True) or {}
+            embedding = _resolve_single_embedding(payload)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
 
-            if "embedding" in p:
-                vec = p["embedding"]
-                ok, msg = _ensure_dim(vec, ARCFACE_DIM)
-                if not ok:
-                    return jsonify({"error": msg}), 400
-                vec = [float(x) for x in vec]
-            else:
-                # 單張影像（或 images 第一張）
-                img = p.get("image") or (p.get("images") or [None])[0]
-                if img is None:
-                    return jsonify({"error": "no embedding or image"}), 400
-                vec = _to_arcface_vector_from_image_payload(img)
+        purchase = payload.get("purchase", "Milk")
+        timestamp = payload.get("timestamp") or datetime.now(UTC).isoformat()
+        spend = float(payload.get("spend", 100.0))
 
-            # 近鄰查詢
-            neighbors = vs_query(vec, k=3)  # → List[Tuple[id, score]]
-            if neighbors:
-                best_id, best_score = neighbors[0]
-                best_score = float(best_score)
-            else:
-                best_id, best_score = "", 0.0
-
-            is_new = (not neighbors) or (best_score < THRESHOLD)
-            if is_new:
-                uid = p.get("id") or f"ID-{int(time.time())}"
+        person_id, confidence, is_new = face_service.identify_embedding(embedding)
+        with connect(app.config["DB_PATH"]) as connection:
+            record = get_user(connection, person_id)
+            if record is None:
+                create_user_record(
+                    connection,
+                    user_id=person_id,
+                    created_at=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="detect_face",
+                )
                 message = "新用戶已建檔"
-                promo = f"首次來店，{p.get('purchase','Milk')} 9折！"
-                # 直接把當前向量上到向量庫，後續就能匹配回來
-                vs_upsert(uid, [vec])
+                promotion = f"首次來店，{purchase} 9折！"
+                is_new = True
             else:
-                uid = str(best_id)
+                record_visit(
+                    connection,
+                    user_id=person_id,
+                    visit_time=timestamp,
+                    purchase=purchase,
+                    spend=spend,
+                    source="detect_face",
+                )
                 message = "老朋友歡迎回來"
-                promo = f"上次買{p.get('purchase','Milk')}，現9折！"
+                promotion = f"上次買{record.last_purchase}，現9折！"
+            recent_visits = fetch_recent_visits(connection, user_id=person_id, limit=5)
 
-            resp = {
-                "id": uid,
-                "confidence": round(best_score, 4),
-                "new_user": is_new,
-                "message": message,
-                "promotion": promo,
-                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
-            }
-            _append_json_line(API_LOG, {"endpoint": "/detect_face", "status": "ok", **resp})
-            return jsonify(resp)
+        duration_ms = (time.perf_counter() - start) * 1000
+        response_payload = {
+            "id": person_id,
+            "confidence": confidence,
+            "new_user": is_new,
+            "message": message,
+            "promotion": promotion,
+            "timestamp": timestamp,
+            "duration_ms": duration_ms,
+            "visit_count": len(recent_visits),
+            "visits": [visit.__dict__ for visit in recent_visits],
+        }
+        return _log_and_response(response_payload, endpoint="/detect_face")
 
-        except Exception as e:
-            err = {
-                "endpoint": "/detect_face",
-                "status": "error",
-                "error": str(e),
-                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
-            }
-            _append_json_line(API_LOG, err)
-            # 以 400 告知可修復的輸入錯誤；非輸入問題可改 500
-            return jsonify({"error": str(e)}), 400
+    @app.get("/admin/users")
+    def list_users() -> Any:
+        with connect(app.config["DB_PATH"]) as connection:
+            records = [record.__dict__ for record in fetch_all_users(connection)]
+        return jsonify({"users": records})
 
     return app
 
 
 app = create_app()
+
 __all__ = ["create_app", "app"]
