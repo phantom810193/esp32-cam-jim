@@ -1,31 +1,27 @@
-name: Cloud - OIDC Face E2E + Summary
+name: Cloud - OIDC + Vertex Pipeline + Multi-face E2E
 
 on:
   workflow_dispatch:
   push:
     branches: [ main, master, develop, 'codex/**' ]
-  pull_request:
 
 permissions:
   id-token: write
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   PROJECT_ID: esp32cam-472912
   REGION: asia-east1
-  SERVICE_URL: ${{ vars.SERVICE_URL }}
+  SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
   PIPELINE_DEF: ${{ vars.PIPELINE_DEF }}
   PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}
   GCS_INBOX: ${{ vars.GCS_INBOX }}
+  CLOUD_RUN_HEALTH_PATH: ${{ vars.CLOUD_RUN_HEALTH_PATH }}
 
 jobs:
   run-pipeline-and-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,6 +38,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
+          version: '>= 477.0.0'
 
       - name: Install tools
         shell: bash
@@ -50,31 +47,36 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl python3 coreutils
 
-      - name: Init counters
-        shell: bash
-        run: |
-          echo "FAILS=0" >> "$GITHUB_ENV"
-          echo "RESULT_HEALTH=SKIPPED" >> "$GITHUB_ENV"
-          echo "RESULT_ENROLL_A=SKIPPED" >> "$GITHUB_ENV"
-          echo "RESULT_ENROLL_B=SKIPPED" >> "$GITHUB_ENV"
-          echo "RESULT_RECOG_A=SKIPPED" >> "$GITHUB_ENV"
-
-      - name: Sanity check env
+      - name: Guard - warn if placeholders not replaced
         shell: bash
         run: |
           set -euo pipefail
-          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX PIPELINE_DEF; do
-            if [ -z "${!v:-}" ]; then
-              echo "::error::Missing variable: $v (set in Settings → Actions → Variables)"; exit 1;
+          if [ -z "${PIPELINE_DEF:-}" ] || [ -z "${PIPELINE_ROOT:-}" ] || [ -z "${GCS_INBOX:-}" ]; then
+            echo "::warning::One or more Variables (PIPELINE_DEF/PIPELINE_ROOT/GCS_INBOX) are empty."
+          fi
+
+      - name: Verify OIDC identity and basic perms
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== Active account =="; gcloud auth list
+          echo "== Try list Cloud Run services (${REGION}) =="
+          if ! gcloud run services list --region="${REGION}" --format='value(name)'; then
+            echo "::warning::Missing roles/run.viewer; continuing."
+          fi
+          for uri in "${PIPELINE_ROOT}" "${GCS_INBOX}"; do
+            if echo "$uri" | grep -q '^gs://'; then
+              bucket="$(echo "$uri" | sed 's#^gs://\([^/]*\).*#\1#')"
+              gsutil ls "gs://${bucket}" || echo "::warning::Cannot access bucket: ${bucket}"
             fi
           done
           if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
-            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "::error::Cannot access ${PIPELINE_DEF}"; exit 1; }
+            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS"; exit 1; }
           else
-            [ -f "${PIPELINE_DEF}" ] || { echo "::error::Missing file ${PIPELINE_DEF} in repo"; exit 1; }
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo"; exit 1; }
           fi
 
-      - name: Run Vertex Pipeline (enroll batch) - version compatible (optional)
+      - name: Run Vertex Pipeline (enroll batch) - version compatible
         id: run_pipeline
         shell: bash
         run: |
@@ -87,7 +89,7 @@ jobs:
               --pipeline-root="${PIPELINE_ROOT}" \
               --display-name="Enroll Batch via CI" \
               --labels=ci=codex,stage=enroll \
-              --format="value(name)" || true)
+              --format="value(name)")
           elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
             JOB_NAME=$(gcloud beta ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
               --region="${REGION}" \
@@ -95,22 +97,20 @@ jobs:
               --pipeline-root="${PIPELINE_ROOT}" \
               --display-name="Enroll Batch via CI" \
               --labels=ci=codex,stage=enroll \
-              --format="value(name)" || true)
+              --format="value(name)")
           elif gcloud ai pipelines --help >/dev/null 2>&1; then
             OUT=$(gcloud ai pipelines run \
               --region="${REGION}" \
               --pipeline-definition-file="${PIPELINE_DEF}" \
               --pipeline-root="${PIPELINE_ROOT}" \
               --display-name="Enroll Batch via CI" \
-              --labels=ci=codex,stage=enroll 2>&1 | tee /tmp/pipelines_run.out || true)
+              --labels=ci=codex,stage=enroll 2>&1 | tee /tmp/pipelines_run.out)
             JOB_NAME=$(grep -o 'projects/.*/locations/.*/pipelineJobs/[a-zA-Z0-9_-]*' /tmp/pipelines_run.out | head -n1 || true)
+          else
+            echo "::warning::No Vertex Pipelines command available; skipping pipeline submission."
           fi
           echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
-          if [ -n "${JOB_NAME}" ]; then
-            echo "Submitted: ${JOB_NAME}"
-          else
-            echo "::notice::Vertex Pipelines command not available or submission skipped."
-          fi
+          echo "Submitted: ${JOB_NAME}"
 
       - name: Wait for enroll to finish (if supported)
         if: ${{ steps.run_pipeline.outputs.job_name && steps.run_pipeline.outputs.job_name != '' }}
@@ -126,31 +126,35 @@ jobs:
             echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
-      - name: Probe Cloud Run /health
+      - name: Probe Cloud Run /health (no impersonation)
         shell: bash
         run: |
           set -euo pipefail
-          URL="${SERVICE_URL%/}/health"
-          echo "GET $URL"
+          URL="${SERVICE_URL%/}${CLOUD_RUN_HEALTH_PATH:-/health}"
+          echo "GET (no-auth) $URL"
           HTTP=$(curl -sS -o /tmp/health_noauth.out -w "%{http_code}" "$URL" || true)
-          echo "HTTP(no-auth)=${HTTP}"
-          if [ "${HTTP}" -ge 200 ] && [ "${HTTP}" -lt 300 ]; then
-            echo "RESULT_HEALTH=PASS" >> "$GITHUB_ENV"
-            cat /tmp/health_noauth.out || true
-          else
-            echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
-            IDT=$(gcloud auth application-default print-identity-token --audiences="$URL")
-            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" \
-                       -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
-            echo "HTTP(auth)=${HTTP2}"
-            echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
-            if [ "${HTTP2}" -ge 200 ] && [ "${HTTP2}" -lt 300 ]; then
-              echo "RESULT_HEALTH=PASS" >> "$GITHUB_ENV"
-            else
-              echo "RESULT_HEALTH=FAIL" >> "$GITHUB_ENV"
-              echo "FAILS=$(( ${FAILS:-0} + 1 ))" >> "$GITHUB_ENV"
-            fi
+          echo "HTTP(no-auth)=$HTTP"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            cat /tmp/health_noauth.out
+            exit 0
           fi
+          echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
+
+          gcloud config unset auth/impersonate_service_account || true
+          IDT=$(gcloud auth print-identity-token --audiences="$URL")
+
+          echo "GET (auth) $URL"
+          n=0
+          while :; do
+            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+            echo "HTTP(auth)=$HTTP2"
+            if [ "$HTTP2" -ge 200 ] && [ "$HTTP2" -lt 300 ]; then
+              echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
+              break
+            fi
+            n=$((n+1)); [ $n -ge 5 ] && { echo "Health check failed after retries"; exit 1; }
+            sleep 3
+          done
 
       - name: Smoke test - multi-person enroll and recognize
         shell: bash
@@ -160,86 +164,34 @@ jobs:
           curl -fsSLo /tmp/faces/A/1.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
           curl -fsSLo /tmp/faces/A/2.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0002.jpg
           curl -fsSLo /tmp/faces/B/1.jpg https://vis-www.cs.umass.edu/lfw/images/Tony_Blair/Tony_Blair_0001.jpg
-
-          b64() { base64 -w 0 "$1" 2>/dev/null || base64 "$1" | tr -d '\n'; }
+          b64() { base64 -w 0 "$1"; }
           A1=$(b64 /tmp/faces/A/1.jpg)
           A2=$(b64 /tmp/faces/A/2.jpg)
           B1=$(b64 /tmp/faces/B/1.jpg)
-
-          # Enroll A
           RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
-            -d "{\"user_id\":\"test-A\",\"images\":[\"data:image/jpeg;base64,${A1}\",\"data:image/jpeg;base64,${A2}\"]}")
-          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d')
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
-            echo "RESULT_ENROLL_A=PASS" >> "$GITHUB_ENV"
-          else
-            echo "RESULT_ENROLL_A=FAIL" >> "$GITHUB_ENV"; echo "$BODY"; echo "FAILS=$(( ${FAILS:-0} + 1 ))" >> "$GITHUB_ENV"
-          fi
-
-          # Enroll B
+            -d "{\"user_id\":\"test-A\",\"images\":[\"data:image/jpeg;base64,$A1\",\"data:image/jpeg;base64,$A2\"]}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .; test "$CODE" -ge 200 -a "$CODE" -lt 300
           RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
-            -d "{\"user_id\":\"test-B\",\"images\":[\"data:image/jpeg;base64,${B1}\"]}")
-          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d')
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
-            echo "RESULT_ENROLL_B=PASS" >> "$GITHUB_ENV"
-          else
-            echo "RESULT_ENROLL_B=FAIL" >> "$GITHUB_ENV"; echo "$BODY"; echo "FAILS=$(( ${FAILS:-0} + 1 ))" >> "$GITHUB_ENV"
-          fi
-
-          # Recognize A
+            -d "{\"user_id\":\"test-B\",\"images\":[\"data:image/jpeg;base64,$B1\"]}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .; test "$CODE" -ge 200 -a "$CODE" -lt 300
           RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/detect_face" \
             -H 'Content-Type: application/json' \
-            -d "{\"images\":[\"data:image/jpeg;base64,${A1}\"],\"purchase\":\"Milk\"}")
-          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d')
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ] \
-             && echo "$BODY" | jq -e '.user_id=="test-A" or .match_user=="test-A" or .is_same_person==true' >/dev/null; then
-            echo "RESULT_RECOG_A=PASS" >> "$GITHUB_ENV"
-          else
-            echo "RESULT_RECOG_A=FAIL" >> "$GITHUB_ENV"; echo "$BODY"; echo "FAILS=$(( ${FAILS:-0} + 1 ))" >> "$GITHUB_ENV"
-          fi
+            -d "{\"images\":[\"data:image/jpeg;base64,$A1\"],\"purchase\":\"Milk\"}")
+          CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .; test "$CODE" -ge 200 -a "$CODE" -lt 300
+          if ! echo "$BODY" | jq -e '.user_id=="test-A" or .match_user=="test-A" or .is_same_person==true' >/dev/null; then
+            echo "Expect a positive match for person A"; exit 1; fi
 
-      - name: Report summary
-        if: always()
+      - name: Prove OIDC in Audit Logs (last 60m)
         shell: bash
         run: |
           set -euo pipefail
-          OVERALL="PASS"
-          if [ "${FAILS:-0}" -gt 0 ]; then OVERALL="FAIL"; fi
-          {
-            echo "## Face E2E Result"
-            echo ""
-            echo "- Overall: **${OVERALL}**"
-            echo "- /health: \`${RESULT_HEALTH}\`"
-            echo "- Enroll A: \`${RESULT_ENROLL_A}\`"
-            echo "- Enroll B: \`${RESULT_ENROLL_B}\`"
-            echo "- Recognize A: \`${RESULT_RECOG_A}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Comment on PR (if PR)
-        if: ${{ always() && github.event_name == 'pull_request' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fails = process.env.FAILS ? parseInt(process.env.FAILS, 10) : 0;
-            const overall = fails > 0 ? '❌ FAIL' : '✅ PASS';
-            const body = [
-              `**Face E2E**: ${overall}`,
-              `- /health: \`${process.env.RESULT_HEALTH}\``,
-              `- Enroll A: \`${process.env.RESULT_ENROLL_A}\``,
-              `- Enroll B: \`${process.env.RESULT_ENROLL_B}\``,
-              `- Recognize A: \`${process.env.RESULT_RECOG_A}\``
-            ].join('\n');
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      - name: Fail job if any step failed
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          test "${FAILS:-0}" -eq 0
+          PROJECT_NUM=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+          gcloud logging read \
+            'resource.type="audited_resource"
+             AND protoPayload.methodName="google.iam.credentials.v1.IAMCredentials.GenerateAccessToken"' \
+            --freshness=60m --limit=20 --format=json \
+          | jq -r '.[].protoPayload.authenticationInfo.principalSubject' \
+          | tee /tmp/subjects.txt
+          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "Found OIDC principal" || { echo "No OIDC principal found"; exit 1; }
