@@ -68,7 +68,6 @@ jobs:
           echo "No test files detected; skipping pytest."
 
   pipeline-check:
-    # needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -79,14 +78,12 @@ jobs:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
 
-      # 建議改用 Repo Variables 設定以下值
       SERVICE_URL: ${{ vars.SERVICE_URL }}
       PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}
       GCS_INBOX: ${{ vars.GCS_INBOX }}
       SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }}
-
-      # 可用 repo 本地檔案或 gs://
       PIPELINE_DEF: ${{ vars.PIPELINE_DEF }}
+      CLOUD_RUN_HEALTH_PATH: ${{ vars.CLOUD_RUN_HEALTH_PATH }}
 
     steps:
       - name: Checkout
@@ -104,6 +101,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
+          version: '>= 477.0.0'
 
       - name: Ensure jq
         shell: bash
@@ -130,7 +128,7 @@ jobs:
           if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
             gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS" >&2; exit 1; }
           else
-            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF}" >&2; exit 1; }
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo" >&2; exit 1; }
           fi
 
           echo "SERVICE_URL=${SERVICE_URL}"
@@ -138,6 +136,7 @@ jobs:
           echo "GCS_INBOX=${GCS_INBOX}"
           echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
           echo "PIPELINE_DEF=${PIPELINE_DEF}"
+          echo "CLOUD_RUN_HEALTH_PATH=${CLOUD_RUN_HEALTH_PATH:-/health}"
 
       - name: Run Vertex Pipeline (enroll batch) - version compatible
         id: run_pipeline
@@ -189,14 +188,12 @@ jobs:
             echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
-      - name: Probe Cloud Run /health
-        env:
-          SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
+      - name: Probe Cloud Run /health (no impersonation)
         shell: bash
         run: |
           set -euo pipefail
-          URL="${SERVICE_URL%/}/health"
-          echo "GET $URL"
+          URL="${SERVICE_URL%/}${CLOUD_RUN_HEALTH_PATH:-/health}"
+          echo "GET (no-auth) $URL"
           HTTP=$(curl -sS -o /tmp/health_noauth.out -w "%{http_code}" "$URL" || true)
           echo "HTTP(no-auth)=$HTTP"
           if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
@@ -204,11 +201,25 @@ jobs:
             exit 0
           fi
           echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
-          IDT=$(gcloud auth print-identity-token --impersonate-service-account="$SA_EMAIL" --audiences="$URL")
-          HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
-          echo "HTTP(auth)=$HTTP2"
-          echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
-          test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
+
+          # 確保沒有殘留 impersonation 設定
+          gcloud config unset auth/impersonate_service_account || true
+
+          echo "Fetch ID token via ADC (no impersonation)"
+          IDT=$(gcloud auth print-identity-token --audiences="$URL")
+
+          echo "GET (auth) $URL"
+          n=0
+          while :; do
+            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+            echo "HTTP(auth)=$HTTP2"
+            if [ "$HTTP2" -ge 200 ] && [ "$HTTP2" -lt 300 ]; then
+              echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
+              break
+            fi
+            n=$((n+1)); [ $n -ge 5 ] && { echo "Health check failed after retries"; exit 1; }
+            sleep 3
+          done
 
       - name: Upload one test photo per person (trigger Eventarc)
         shell: bash
