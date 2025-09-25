@@ -25,3 +25,20 @@ jobs:
           gcloud auth list
           gcloud config list project
           gcloud projects describe esp32cam-472912 --format='value(projectNumber,projectId)'
+
+                - name: GCS read/write check
+        run: |
+          gsutil ls gs://esp32cam-472912-vertex-data | head -n 5
+          echo "test $(date)" > /tmp/ci.txt
+          gsutil cp /tmp/ci.txt gs://esp32cam-472912-faces/new_photos/ci_$(date +%s).txt
+
+      - name: Vertex list check
+        run: |
+          gcloud ai pipeline-jobs list --region=asia-east1 --limit=3
+
+      - name: Cloud Run /health
+        env:
+          SERVICE_URL: ${{ vars.SERVICE_URL }}
+        run: |
+          curl -fS "${SERVICE_URL%/}/health" -i
+
