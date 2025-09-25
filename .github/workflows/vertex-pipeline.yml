@@ -1,0 +1,195 @@
+name: Vertex Pipeline E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcs_inbox:
+        description: "GCS inbox bucket or prefix (e.g. gs://bucket/inbox)"
+        required: false
+        default: ""
+      index_id:
+        description: "Existing Matching Engine index resource name"
+        required: false
+        default: ""
+      endpoint_id:
+        description: "Existing Matching Engine index endpoint resource name"
+        required: false
+        default: ""
+      service_name:
+        description: "Cloud Run service name"
+        required: false
+        default: ""
+
+jobs:
+  oidc-smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PROJECT_ID: esp32cam-472912
+      REGION: asia-east1
+      EXPECTED_ACCOUNT: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate via OIDC
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
+          service_account: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          export_default_credentials: true
+
+      - name: Verify active service account
+        run: |
+          set -euo pipefail
+          echo "Listing active credentials"
+          gcloud auth list --filter=status:ACTIVE
+          ACTIVE_ACCOUNT="$(gcloud config get-value account)"
+          echo "Active SA = ${ACTIVE_ACCOUNT}"
+          if [ "${ACTIVE_ACCOUNT}" != "${EXPECTED_ACCOUNT}" ]; then
+            echo "::error::Active account (${ACTIVE_ACCOUNT}) does not match expected (${EXPECTED_ACCOUNT})"
+            exit 1
+          fi
+          gcloud ai index-endpoints list --region="${REGION}" --project="${PROJECT_ID}"
+
+  run:
+    runs-on: ubuntu-latest
+    needs: [oidc-smoke-test]
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PROJECT_ID: esp32cam-472912
+      REGION: asia-east1
+      PIPELINE_ROOT: gs://esp32cam-472912-vertex-staging/kfp-artifacts
+      FACES_ROOT: gs://esp32cam-472912-vertex-data/faces
+      DEFAULT_INBOX: gs://esp32cam-472912-inbox
+      SERVICE_ACCOUNT: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
+          service_account: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          export_default_credentials: true
+          components: beta,alpha
+
+      - name: Configure workflow variables
+        run: |
+          set -euo pipefail
+          GCS_INBOX_INPUT="${{ inputs.gcs_inbox }}"
+          if [ -z "$GCS_INBOX_INPUT" ]; then
+            if gcloud storage buckets list --filter="name:esp32cam-472912-inbox" --format="value(name)" | grep -q .; then
+              GCS_INBOX_INPUT="gs://esp32cam-472912-inbox"
+            else
+              GCS_INBOX_INPUT="$DEFAULT_INBOX"
+            fi
+          fi
+          echo "GCS_INBOX=$GCS_INBOX_INPUT" >> "$GITHUB_ENV"
+
+          INDEX_ID_INPUT="${{ inputs.index_id }}"
+          if [ -z "$INDEX_ID_INPUT" ]; then
+            INDEX_ID_INPUT=$(gcloud ai indexes list --region="$REGION" --format="value(name)" --filter="displayName=faces-index-stream-512" | tail -n 1 || true)
+          fi
+          if [ -z "$INDEX_ID_INPUT" ]; then
+            echo "::warning::No existing index found. Please create or supply index_id input."
+          fi
+          echo "INDEX_ID=$INDEX_ID_INPUT" >> "$GITHUB_ENV"
+
+          ENDPOINT_ID_INPUT="${{ inputs.endpoint_id }}"
+          if [ -z "$ENDPOINT_ID_INPUT" ]; then
+            ENDPOINT_ID_INPUT=$(gcloud ai index-endpoints list --region="$REGION" --format="value(name)" --filter="displayName=faces-index-stream-512" | tail -n 1 || true)
+          fi
+          if [ -z "$ENDPOINT_ID_INPUT" ]; then
+            echo "::warning::No existing endpoint found. Please create or supply endpoint_id input."
+          fi
+          echo "ENDPOINT_ID=$ENDPOINT_ID_INPUT" >> "$GITHUB_ENV"
+
+          SERVICE_NAME_INPUT="${{ inputs.service_name }}"
+          if [ -z "$SERVICE_NAME_INPUT" ]; then
+            SERVICE_NAME_INPUT=$(gcloud run services list --platform=managed --region="$REGION" --format="value(metadata.name)" | grep -m1 esp32-cam-jim || true)
+          fi
+          if [ -z "$SERVICE_NAME_INPUT" ]; then
+            SERVICE_NAME_INPUT="esp32-cam-jim"
+          fi
+          echo "SERVICE_NAME=$SERVICE_NAME_INPUT" >> "$GITHUB_ENV"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            google-cloud-aiplatform \
+            google-cloud-storage \
+            google-cloud-logging \
+            kfp \
+            requests==2.32.3 \
+            numpy==1.26.4 \
+            pillow==10.3.0 \
+            tqdm==4.66.5 \
+            opencv-python-headless==4.10.0.84 \
+            onnxruntime==1.17.3 \
+            onnx==1.15.0 \
+            insightface==0.7.3
+
+      - name: Compile pipeline specification
+        run: |
+          set -euo pipefail
+          python pipeline/compile.py
+
+      - name: Submit Vertex pipeline
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python scripts/submit_pipeline.py \
+            --project $PROJECT_ID \
+            --region $REGION \
+            --service-account $SERVICE_ACCOUNT \
+            --template pipeline/pipeline.json \
+            --pipeline-root $PIPELINE_ROOT \
+            --index-name "$INDEX_ID" \
+            --gcs-faces-root $FACES_ROOT \
+            --log-file artifacts/pipeline_job.log \
+            --summary-file artifacts/pipeline_job_summary.json
+
+      - name: Run end-to-end verification
+        run: |
+          set -euo pipefail
+          python scripts/e2e_verify.py \
+            --project $PROJECT_ID \
+            --region $REGION \
+            --gcs-inbox "$GCS_INBOX" \
+            --endpoint "$ENDPOINT_ID" \
+            --index "$INDEX_ID" \
+            --service-name "$SERVICE_NAME" \
+            --pipeline-summary artifacts/pipeline_job_summary.json \
+            --log-dir artifacts
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vertex-pipeline-artifacts
+          path: artifacts
