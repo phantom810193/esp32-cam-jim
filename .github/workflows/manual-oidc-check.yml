@@ -4,40 +4,63 @@ on:
   workflow_dispatch:
 
 jobs:
-  smoke:
+  oidc-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 關鍵：一定要有 id-token: write，否則 OIDC 不會簽出臨時憑證
     permissions:
       id-token: write
       contents: read
+
     env:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
-      EXPECTED_ACCOUNT: codex-ci@esp32cam-472912.iam.gserviceaccount.com
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      SERVICE_ACCOUNT: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+      WIP: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
 
-      - name: Authenticate via OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth via OIDC
         id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
-          service_account: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+          workload_identity_provider: ${{ env.WIP }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-          export_default_credentials: true
+          version: '>= 477.0.0'
 
-      - name: Validate service account
+      - name: Show active account (should be the SA)
         run: |
           set -euo pipefail
           gcloud auth list --filter=status:ACTIVE
-          ACTIVE_ACCOUNT="$(gcloud config get-value account)"
-          echo "Active SA = ${ACTIVE_ACCOUNT}"
-          if [ "${ACTIVE_ACCOUNT}" != "${EXPECTED_ACCOUNT}" ]; then
-            echo "::error::Active account (${ACTIVE_ACCOUNT}) does not match expected (${EXPECTED_ACCOUNT})"
+          ACCT=$(gcloud config get-value account)
+          echo "Active: $ACCT"
+          gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)'
+
+      - name: Sanity check - list resources
+        run: |
+          set -euo pipefail
+          echo "List GCS buckets (need storage viewer at least)"
+          gcloud storage buckets list --project "$PROJECT_ID" --format='value(name)' | head -n 10 || true
+
+          echo "List Vertex Index Endpoints (need aiplatform.user)"
+          gcloud ai index-endpoints list --project "$PROJECT_ID" --region "$REGION" --format='table(name,displayName)'
+
+      - name: Final assertion
+        run: |
+          set -euo pipefail
+          ACCT=$(gcloud config get-value account)
+          if [ "$ACCT" != "${SERVICE_ACCOUNT}" ]; then
+            echo "::error::Active account is not the expected service account."
+            echo "Expected: ${SERVICE_ACCOUNT}"
+            echo "Actual:   ${ACCT}"
             exit 1
           fi
-          gcloud ai index-endpoints list --region="${REGION}" --project="${PROJECT_ID}"
+          echo "✅ OIDC looks good. Active SA: $ACCT"
