@@ -1,87 +1,119 @@
 from kfp import dsl
-from kfp.dsl import component, Dataset, Output
-import json
+from kfp.dsl import component
 
 @component(
-    base_image="python:3.11-slim",
+    base_image="python:3.10-slim",
     packages_to_install=[
+        # 只裝 GCP SDK，其他用函式內動態安裝（先解決 g++）
         "google-cloud-storage",
         "google-cloud-aiplatform>=1.48.0",
-        "insightface==0.7.3",        # 會自動下載模型（MIT；預訓練模型非商用）
-        "onnxruntime==1.18.0",
-        "opencv-python-headless==4.10.0.84",
-        "numpy>=1.24,<3",
-        "Pillow"
     ],
 )
-def embed_and_upsert_op(
-    project_id: str,
-    region: str,
-    index_name: str,        # projects/.../locations/.../indexes/...
-    gcs_faces_root: str,    # gs://esp32cam-472912-vertex-data/faces
-    out_log: Output[Dataset],
-):
-    import os, io
+def embed_and_upsert_op(project_id: str,
+                        region: str,
+                        index_name: str,        # projects/.../indexes/...
+                        gcs_faces_root: str):   # gs://.../faces/<person_id>/*.jpg
+    import subprocess, sys, io
+    # ---- 先安裝系統編譯與影像相關套件（提供 g++ 等）----
+    subprocess.run(
+        ["bash","-lc",
+         "apt-get update && apt-get install -y --no-install-recommends "
+         "build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 "
+         "&& rm -rf /var/lib/apt/lists/*"],
+        check=True)
+    # ---- 再安裝 Python 相依（這時候有 g++ 可編 C/Cython）----
+    subprocess.run([sys.executable,"-m","pip","install","--no-cache-dir",
+                    "insightface==0.7.3",
+                    "onnxruntime==1.18.0",
+                    "opencv-python-headless==4.10.0.84",
+                    "numpy>=1.24,<3",
+                    "Pillow"], check=True)
+
+    # 之後再 import，確保套件可用
     from google.cloud import storage, aiplatform_v1 as gapic
     from PIL import Image
     import numpy as np
     import insightface
 
-    # 1) 準備 GCS
-    client = storage.Client(project=project_id)
-    bucket_name = gcs_faces_root.split("/")[2]
-    prefix = "/".join(gcs_faces_root.split("/")[3:])
-    bucket = client.bucket(bucket_name)
+    # 解析 GCS 路徑
+    parts = gcs_faces_root.split("/")
+    bucket_name = parts[2]
+    prefix = "/".join(parts[3:]).rstrip("/") + "/"
 
-    # 2) 讀全部臉照清單（每人資料夾）
-    blobs = client.list_blobs(bucket, prefix=prefix)
-    paths = [b.name for b in blobs if b.name.lower().endswith((".jpg",".jpeg",".png"))]
+    # 列檔案
+    storage_client = storage.Client(project=project_id)
+    blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
 
-    # 3) 載入 InsightFace（含偵測與 512D embedding）
-    app = insightface.app.FaceAnalysis(name="buffalo_l")  # 內含檢測/對齊/embedding
-    app.prepare(ctx_id=0, det_size=(640,640))
+    # InsightFace：偵測/對齊/嵌入（CPU）
+    app = insightface.app.FaceAnalysis(name="buffalo_l")
+    app.prepare(ctx_id=-1, det_size=(640, 640))
 
-    # 4) 準備 upsert client（low-level，確保相容性）
+    # Vector Search 串流 upsert
     api_endpoint = f"{region}-aiplatform.googleapis.com"
-    index_client = gapic.IndexServiceClient(client_options={"api_endpoint": api_endpoint})
+    index_client = gapic.IndexServiceClient(
+        client_options={"api_endpoint": api_endpoint}
+    )
 
-    # 5) 逐檔處理
-    upserts = []
-    for p in paths:
-        person_id = p.split("/")[-2] if "/" in p else "unknown"
-        blob = bucket.blob(p)
-        img = Image.open(io.BytesIO(blob.download_as_bytes())).convert("RGB")
-        img = np.array(img)[:,:,::-1]   # to BGR
-
-        faces = app.get(img)
-        if not faces:
+    batch, sent = [], 0
+    for blob in blobs:
+        name = blob.name.lower()
+        if not (name.endswith(".jpg") or name.endswith(".jpeg") or name.endswith(".png")):
             continue
+
+        # 依 <person_id>/file.jpg 推導 person_id
+        path_parts = blob.name.split("/")
+        if len(path_parts) < 2:
+            continue
+        person_id = path_parts[-2]
+        file_name = path_parts[-1]
+
+        try:
+            img = Image.open(io.BytesIO(blob.download_as_bytes())).convert("RGB")
+        except Exception as e:
+            print(f"[skip] open {blob.name} failed: {e}")
+            continue
+
+        arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+        faces = app.get(arr)
+        if not faces:
+            print(f"[skip] no face: {blob.name}")
+            continue
+
         # 取最大臉
-        face = max(faces, key=lambda f: f.bbox[2]*f.bbox[3])
-        emb = face.normed_embedding.astype(float).tolist()  # 512 維
+        def area(f):
+            x1, y1, x2, y2 = f.bbox.astype(float)
+            return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+        face = max(faces, key=area)
 
-        # datapoint_id 可以用 personId#檔名
-        datapoint_id = f"{person_id}#{os.path.basename(p)}"
-        upserts.append(
-            gapic.IndexDatapoint(
-                datapoint_id=datapoint_id,
-                feature_vector=emb,
-                restricts=[gapic.IndexDatapoint.Restriction(namespace="person", allow_list=[person_id])]
-            )
+        emb = face.normed_embedding.astype(float).tolist()  # 512D
+
+        dp = gapic.IndexDatapoint(
+            datapoint_id=f"{person_id}#{file_name}",
+            feature_vector=emb,
+            restricts=[gapic.IndexDatapoint.Restriction(
+                namespace="person", allow_list=[person_id]
+            )],
         )
+        batch.append(dp)
+        if len(batch) >= 128:
+            index_client.upsert_datapoints(index=index_name, datapoints=batch)
+            sent += len(batch)
+            batch = []
 
-        # 批次分批送，避免 payload 太大
-        if len(upserts) >= 128:
-            index_client.upsert_datapoints(index=index_name, datapoints=upserts)
-            upserts = []
+    if batch:
+        index_client.upsert_datapoints(index=index_name, datapoints=batch)
+        sent += len(batch)
 
-    if upserts:
-        index_client.upsert_datapoints(index=index_name, datapoints=upserts)
-
-    # 簡單寫個輸出日誌
-    with open(out_log.path, "w") as f:
-        f.write(json.dumps({"processed": len(paths)}))
+    print(f"Upserted datapoints: {sent}")
 
 @dsl.pipeline(name="faces-embed-upsert")
-def pipeline(project_id: str, region: str, index_name: str, gcs_faces_root: str):
-    embed_and_upsert_op(project_id, region, index_name, gcs_faces_root)
+def pipeline(project_id: str = "esp32cam-472912",
+             region: str = "asia-east1",
+             index_name: str = "projects/esp32cam-472912/locations/asia-east1/indexes/xxxxxxxx",
+             gcs_faces_root: str = "gs://esp32cam-472912-vertex-data/faces"):
+    embed_and_upsert_op(
+        project_id=project_id,
+        region=region,
+        index_name=index_name,
+        gcs_faces_root=gcs_faces_root,
+    )
