@@ -68,7 +68,7 @@ jobs:
           echo "No test files detected; skipping pytest."
 
   pipeline-check:
-    # needs: tests   # 若要先跑單元測試再跑，取消註解
+    # needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -79,14 +79,14 @@ jobs:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
 
-      # 建議這四個由 Repo → Settings → Actions → Variables 提供
-      SERVICE_URL: ${{ vars.SERVICE_URL }}           # 例：https://esp32-cam-jim-XXXX.asia-east1.run.app
-      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}       # 例：gs://<bucket>/kfp-root
-      GCS_INBOX: ${{ vars.GCS_INBOX }}               # 例：gs://<bucket>/new_photos
-      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://<bucket>/faces/personA/
+      # 建議改用 Repo Variables 設定以下值
+      SERVICE_URL: ${{ vars.SERVICE_URL }}
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}
+      GCS_INBOX: ${{ vars.GCS_INBOX }}
+      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }}
 
-      # 若你改用 GCS 路徑，可把變數 PIPELINE_DEF 設為 gs://.../face_enroll_recognize.json
-      PIPELINE_DEF: ${{ vars.PIPELINE_DEF || 'pipelines/face_enroll_recognize.json' }}
+      # 可用 repo 本地檔案或 gs://
+      PIPELINE_DEF: ${{ vars.PIPELINE_DEF }}
 
     steps:
       - name: Checkout
@@ -97,20 +97,15 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
-
-      - name: Who am I (GCP identity)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo -n "Active account: "
-          gcloud auth list --filter=status:ACTIVE --format='value(account)'
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Ensure jq (for JSON building)
+      - name: Ensure jq
         shell: bash
         run: |
           set -euo pipefail
@@ -120,17 +115,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI PIPELINE_DEF; do
+          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
             if [ -z "${!v:-}" ]; then
-              echo "Missing required variable: $v (set repo variable in Settings → Actions → Variables)" >&2
+              echo "Missing required variable: $v (set in Settings → Actions → Variables)" >&2
               exit 1
             fi
           done
-          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
-            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS"; exit 1; }
-          else
-            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo"; exit 1; }
+
+          if [ -z "${PIPELINE_DEF:-}" ]; then
+            echo "Missing variable: PIPELINE_DEF" >&2
+            exit 1
           fi
+
+          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
+            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS" >&2; exit 1; }
+          else
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo" >&2; exit 1; }
+          fi
+
           echo "SERVICE_URL=${SERVICE_URL}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
           echo "GCS_INBOX=${GCS_INBOX}"
@@ -184,10 +186,12 @@ jobs:
           elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
             gcloud beta ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
           else
-            echo "::notice::No 'pipeline-jobs wait' available; continuing without waiting."
+            echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
       - name: Probe Cloud Run /health
+        env:
+          SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
         shell: bash
         run: |
           set -euo pipefail
@@ -197,14 +201,14 @@ jobs:
           echo "HTTP(no-auth)=$HTTP"
           if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
             cat /tmp/health_noauth.out
-          else
-            echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
-            IDT=$(gcloud auth print-identity-token --audiences="$URL")
-            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
-            echo "HTTP(auth)=$HTTP2"
-            echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
-            test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
+            exit 0
           fi
+          echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
+          IDT=$(gcloud auth print-identity-token --impersonate-service-account="$SA_EMAIL" --audiences="$URL")
+          HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(auth)=$HTTP2"
+          echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
+          test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
 
       - name: Upload one test photo per person (trigger Eventarc)
         shell: bash
@@ -239,7 +243,8 @@ jobs:
               payload=$(jq -cn --arg b64 "$b64" --arg person "$person" \
                          '{images: ["data:image/jpeg;base64," + $b64], person: $person}')
               echo "POST /detect_face for ${person}"
-              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" -H "Content-Type: application/json" -d "$payload" >/dev/null; then
+              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" \
+                    -H "Content-Type: application/json" -d "$payload" >/dev/null; then
                 echo "FAIL: ${person}"
                 fails=$((fails+1))
               fi
