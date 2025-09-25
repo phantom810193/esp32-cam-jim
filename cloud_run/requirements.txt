@@ -1,0 +1,13 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+numpy==1.26.4
+onnxruntime==1.17.3
+opencv-python-headless==4.10.0.84
+scikit-image==0.22.0
+Pillow==10.3.0
+tqdm==4.66.4
+requests==2.32.3
+google-cloud-storage==2.16.0
+google-cloud-aiplatform==1.48.0
+insightface==0.7.3
+python-multipart==0.0.9
