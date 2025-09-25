@@ -40,12 +40,13 @@ jobs:
         with:
           workload_identity_provider: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
           service_account: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-          export_default_credentials: true
 
       - name: Verify active service account
         run: |
@@ -83,13 +84,14 @@ jobs:
         with:
           workload_identity_provider: projects/665759721336/locations/global/workloadIdentityPools/github-pool/providers/github-actions
           service_account: codex-ci@esp32cam-472912.iam.gserviceaccount.com
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-          export_default_credentials: true
-          components: beta,alpha
+          install_components: 'beta alpha'
 
       - name: Configure workflow variables
         run: |
