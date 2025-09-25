@@ -26,21 +26,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Auth to GCP via OIDC
-        id: auth
+      - name: Auth to GCP via OIDC (ADC)
+        id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
           create_credentials_file: true
           export_environment_variables: true
-
-      - name: Export ADC env (defensive)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${{ steps.auth.outputs.credentials_file_path }}" >> "$GITHUB_ENV"
-          echo "GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}" >> "$GITHUB_ENV"
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
@@ -134,13 +127,22 @@ jobs:
             echo "::notice::No 'pipeline-jobs wait' available; continuing."
           fi
 
-      - name: Probe Cloud Run /health (ADC, no impersonation)
+      - name: Fetch ID token for Cloud Run (via auth action)
+        id: idt
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          token_format: 'id_token'
+          audience: ${{ env.SERVICE_URL }}
+
+      - name: Probe Cloud Run /health (no impersonation)
         shell: bash
+        env:
+          IDT: ${{ steps.idt.outputs.id_token }}
         run: |
           set -euo pipefail
-          BASE="${SERVICE_URL%/}"
-          URL="${BASE}${CLOUD_RUN_HEALTH_PATH:-/health}"
-
+          URL="${SERVICE_URL%/}${CLOUD_RUN_HEALTH_PATH:-/health}"
           echo "GET (no-auth) $URL"
           HTTP=$(curl -sS -o /tmp/health_noauth.out -w "%{http_code}" "$URL" || true)
           echo "HTTP(no-auth)=$HTTP"
@@ -149,9 +151,6 @@ jobs:
             exit 0
           fi
           echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
-
-          gcloud config unset auth/impersonate_service_account || true
-          IDT=$(gcloud auth application-default print-identity-token --audiences="$BASE")
 
           echo "GET (auth) $URL"
           n=0
