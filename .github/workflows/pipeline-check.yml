@@ -1,20 +1,18 @@
-name: Cloud – OIDC + Vertex Pipeline + Multi-face E2E
+name: Cloud - OIDC + Vertex Pipeline + Multi-face E2E
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, develop, "codex/**" ]
+    branches: [ main, master, develop, 'codex/**' ]
 
 permissions:
-  id-token: write   # ！！！OIDC 必須
+  id-token: write
   contents: read
 
 env:
   PROJECT_ID: esp32cam-472912
   REGION: asia-east1
   SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
-
-  # === 若你要跑 Vertex Pipeline / Eventarc，請把兩個值改成真的 GCS 路徑 ===
   PIPELINE_DEF: pipelines/face_enroll_recognize.json
   PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
   GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
@@ -28,7 +26,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 以 GitHub OIDC 扮演 GCP 服務帳號（無任何 JSON 金鑰）
       - name: Auth to GCP via OIDC
         uses: google-github-actions/auth@v2
         with:
@@ -43,12 +40,14 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Install tools
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq curl python3
+          sudo apt-get install -y jq curl python3 coreutils
 
-      - name: Guard – warn if placeholders not replaced
+      - name: Guard - warn if placeholders not replaced
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::Env summary"
@@ -58,14 +57,14 @@ jobs:
             echo "::warning::You are still using placeholder GCS paths. Vertex/Eventarc steps will be skipped."
           fi
 
-      - name: Verify OIDC identity & basic perms
+      - name: Verify OIDC identity and basic perms
+        shell: bash
         run: |
           set -euo pipefail
           echo "== Active account =="
           gcloud auth list
           echo "== List Cloud Run services (${REGION}) =="
           gcloud run services list --region="${REGION}" || exit 1
-          # 嘗試列出 Pipeline Root / Inbox 的 bucket（若為有效 gs://）
           for uri in "${PIPELINE_ROOT}" "${GCS_INBOX}"; do
             if echo "$uri" | grep -q '^gs://'; then
               bucket="$(echo "$uri" | sed 's#^gs://\([^/]*\).*#\1#')"
@@ -74,13 +73,12 @@ jobs:
             fi
           done
 
-      # ===== (可選) Vertex AI Pipeline：若檔案/路徑齊全才會執行 =====
-      - name: Run Vertex Pipeline (enroll batch) – conditional
+      - name: Run Vertex Pipeline (enroll batch) - conditional
         id: run_pipeline
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f "${PIPELINE_DEF}" ] && echo "${PIPELINE_ROOT}" | grep -q '^gs://'; then
-            echo "Submitting Vertex pipeline..."
             JOB_NAME=$(gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
               --region="${REGION}" \
               --pipeline-definition-file="${PIPELINE_DEF}" \
@@ -94,33 +92,32 @@ jobs:
             echo "Skip: PIPELINE_DEF not found or PIPELINE_ROOT not a gs:// path."
           fi
 
-      - name: Wait for enroll to finish – conditional
-        if: steps.run_pipeline.outputs.job_name
+      - name: Wait for enroll to finish - conditional
+        if: ${{ steps.run_pipeline.outputs.job_name && steps.run_pipeline.outputs.job_name != '' }}
+        shell: bash
         run: |
           set -euo pipefail
           JOB_NAME="${{ steps.run_pipeline.outputs.job_name }}"
           echo "Waiting for ${JOB_NAME} ..."
           gcloud ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
 
-      # ===== (可選) 透過上傳圖片觸發 Eventarc → Cloud Run （若 GCS_INBOX 有效）=====
-      - name: Upload a test photo to trigger Eventarc – conditional
+      - name: Upload a test photo to trigger Eventarc - conditional
+        if: ${{ startsWith(env.GCS_INBOX, 'gs://') }}
+        shell: bash
         run: |
           set -euo pipefail
-          if echo "${GCS_INBOX}" | grep -q '^gs://'; then
-            mkdir -p /tmp/ci && cd /tmp/ci
-            curl -fsSLo face_trigger.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
-            gsutil cp face_trigger.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
-          else
-            echo "Skip: GCS_INBOX is not a valid gs:// path."
-          fi
+          mkdir -p /tmp/ci && cd /tmp/ci
+          curl -fsSLo face_trigger.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0001.jpg
+          gsutil cp face_trigger.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
 
       - name: Probe Cloud Run /health
+        shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${SERVICE_URL}/health"
+          curl -fsSL "${SERVICE_URL%/}/health"
 
-      # ===== 黑箱 E2E：多人臉 Enroll(A/B) + Recognize(A) =====
-      - name: Smoke test – multi-person enroll & recognize
+      - name: Smoke test - multi-person enroll and recognize
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/faces/A /tmp/faces/B
@@ -128,40 +125,39 @@ jobs:
           curl -fsSLo /tmp/faces/A/2.jpg https://vis-www.cs.umass.edu/lfw/images/George_W_Bush/George_W_Bush_0002.jpg
           curl -fsSLo /tmp/faces/B/1.jpg https://vis-www.cs.umass.edu/lfw/images/Tony_Blair/Tony_Blair_0001.jpg
 
-          b64() { python3 - "$1" <<'PY'
-import sys, base64; print(base64.b64encode(open(sys.argv[1],'rb').read()).decode())
-PY
-          }
+          b64() { base64 -w 0 "$1"; }
+
           A1=$(b64 /tmp/faces/A/1.jpg)
           A2=$(b64 /tmp/faces/A/2.jpg)
           B1=$(b64 /tmp/faces/B/1.jpg)
 
           echo "== Enroll A =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
             -d "{\"user_id\":\"test-A\",\"images\":[\"data:image/jpeg;base64,$A1\",\"data:image/jpeg;base64,$A2\"]}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
 
           echo "== Enroll B =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/enroll" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/enroll" \
             -H 'Content-Type: application/json' \
             -d "{\"user_id\":\"test-B\",\"images\":[\"data:image/jpeg;base64,$B1\"]}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
 
           echo "== Recognize A (should match test-A) =="
-          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL}/detect_face" \
+          RES=$(curl -sS -w '\n%{http_code}' -X POST "${SERVICE_URL%/}/detect_face" \
             -H 'Content-Type: application/json' \
             -d "{\"images\":[\"data:image/jpeg;base64,$A1\"],\"purchase\":\"Milk\"}")
           CODE=$(echo "$RES" | tail -n1); BODY=$(echo "$RES" | sed '$d'); echo "$BODY" | jq .
           test "$CODE" -ge 200 -a "$CODE" -lt 300
-          # 你的 API 欄位可能不同：容錯式判定
           if ! echo "$BODY" | jq -e '.user_id=="test-A" or .match_user=="test-A" or .is_same_person==true' >/dev/null; then
-            echo "::error::Expect a positive match for person A"; exit 1; fi
+            echo "Expect a positive match for person A"
+            exit 1
+          fi
 
-      # ===== 用審計日誌證明真的走 OIDC（無金鑰）=====
       - name: Prove OIDC in Audit Logs (last 60m)
+        shell: bash
         run: |
           set -euo pipefail
           PROJECT_NUM=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
@@ -172,4 +168,4 @@ PY
           | jq -r '.[].protoPayload.authenticationInfo.principalSubject' \
           | tee /tmp/subjects.txt
           echo "Look for principal://iam.googleapis.com/projects/${PROJECT_NUM}/locations/global/workloadIdentityPools/..."
-          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "✅ Found OIDC principal" || (echo "::warning::No OIDC principal found"; exit 1)
+          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "Found OIDC principal" || { echo "No OIDC principal found"; exit 1; }
