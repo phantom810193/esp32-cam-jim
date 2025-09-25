@@ -1,9 +1,13 @@
 name: Vertex Pipeline - Enroll & Recognize Check
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
-    branches: [ main, master, develop, "codex/**" ]
+    branches:
+      - main
+      - master
+      - develop
+      - "codex/**"
 
 permissions:
   id-token: write
@@ -14,7 +18,7 @@ env:
   REGION: asia-east1
   SERVICE_URL: https://esp32-cam-jim-665759721336.asia-east1.run.app
 
-  # TODO: 請改成你實際路徑/桶名
+  # TODO: 改成你實際路徑/桶名
   PIPELINE_DEF: pipelines/face_enroll_recognize.json
   PIPELINE_ROOT: gs://YOUR_PIPELINE_BUCKET/kfp-root
   GCS_INBOX: gs://YOUR_GCS_INBOX_BUCKET/new_photos
@@ -38,7 +42,9 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Run Vertex Pipeline (enroll batch)
+        shell: bash
         run: |
+          set -euo pipefail
           gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
             --region="${REGION}" \
             --pipeline-definition-file="${PIPELINE_DEF}" \
@@ -48,32 +54,40 @@ jobs:
             --format="value(name)"
 
       - name: Wait for enroll to finish
+        shell: bash
         run: |
+          set -euo pipefail
           JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
             --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
           echo "JOB_ID=$JOB_ID"
           gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
 
       - name: Upload a test photo to trigger Eventarc
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Uploading test image to ${GCS_INBOX}..."
-          gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX}/ci_test_$(date +%s).jpg"
+          gsutil cp samples/faces/personA/01.jpg "${GCS_INBOX%/}/ci_test_$(date +%s).jpg"
 
       - name: Probe Cloud Run /health
+        shell: bash
         run: |
-          curl -fsSL "${SERVICE_URL}/health"
+          set -euo pipefail
+          curl -fsSL "${SERVICE_URL%/}/health"
 
       - name: Recognize via API (existing face)
+        shell: bash
         run: |
-          python3 - <<'PY'
-import base64, json, os, urllib.request
-img = "samples/faces/personA/02.jpg"
-b64 = base64.b64encode(open(img,"rb").read()).decode()
-payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "purchase":"Milk"}).encode()
-req = urllib.request.Request(os.environ["SERVICE_URL"]+"/detect_face", data=payload, headers={"Content-Type":"application/json"})
-resp = urllib.request.urlopen(req, timeout=60)
-print(resp.read().decode())
-PY
+          set -euo pipefail
+          python3 -c "import base64,json,os,urllib.request
+img='samples/faces/personA/02.jpg'
+b64=base64.b64encode(open(img,'rb').read()).decode()
+payload=json.dumps({'images':['data:image/jpeg;base64,'+b64],'purchase':'Milk'}).encode()
+service_url=os.environ['SERVICE_URL'].rstrip('/')+'/detect_face'
+req=urllib.request.Request(service_url,data=payload,headers={'Content-Type':'application/json'})
+print(urllib.request.urlopen(req,timeout=60).read().decode())"
+
       - name: (Optional) Assert Firestore writes (visits increment)
+        shell: bash
         run: |
           echo "若有 /debug 端點可在此查驗；否則改查雲端日誌或 Firestore。"
