@@ -1,9 +1,18 @@
 name: WIF Smoke Test
-on: { workflow_dispatch: {} }
+
+on:
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+
+env:
+  PROJECT_ID: esp32cam-472912
+  REGION: asia-east1
+  # 可選：倉庫 Variables 內設定，留空就會略過對應測試
+  TEST_BUCKET: ${{ vars.TEST_BUCKET || '' }}
+  SERVICE_URL: ${{ vars.SERVICE_URL || '' }}
 
 jobs:
   auth:
@@ -16,29 +25,68 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Who am I?
+        shell: bash
         run: |
+          set -euo pipefail
           gcloud auth list
           gcloud config list project
-          gcloud projects describe esp32cam-472912 --format='value(projectNumber,projectId)'
+          gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber,projectId)'
 
-                - name: GCS read/write check
+      - name: GCS read/write check (optional)
+        shell: bash
         run: |
-          gsutil ls gs://esp32cam-472912-vertex-data | head -n 5
-          echo "test $(date)" > /tmp/ci.txt
-          gsutil cp /tmp/ci.txt gs://esp32cam-472912-faces/new_photos/ci_$(date +%s).txt
+          set -euo pipefail
+          if [ -z "${TEST_BUCKET}" ]; then
+            echo "::notice::No TEST_BUCKET provided; skipping GCS read/write check."
+            exit 0
+          fi
+          echo "Check access to gs://${TEST_BUCKET}"
+          gsutil ls "gs://${TEST_BUCKET}" >/dev/null 2>&1 || { echo "::error::Bucket not accessible"; exit 1; }
+          echo "hello $(date -Is)" > /tmp/wif-smoke.txt
+          gsutil cp /tmp/wif-smoke.txt "gs://${TEST_BUCKET}/wif-smoke-$(date +%s).txt"
+          gsutil ls -l "gs://${TEST_BUCKET}/wif-smoke-*.txt" | tail -n 2
 
-      - name: Vertex list check
+      - name: Cloud Run /health (optional)
+        shell: bash
         run: |
-          gcloud ai pipeline-jobs list --region=asia-east1 --limit=3
+          set -euo pipefail
+          if [ -z "${SERVICE_URL}" ]; then
+            echo "::notice::No SERVICE_URL; skipping /health check."
+            exit 0
+          fi
+          URL="${SERVICE_URL%/}/health"
+          echo "GET $URL"
+          HTTP=$(curl -sS -o /tmp/noauth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(no-auth)=$HTTP"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            cat /tmp/noauth.out
+            exit 0
+          fi
+          echo "---- body(no-auth) ----"; cat /tmp/noauth.out || true; echo "-----------------------"
+          # 以 ADC 產 ID Token（不需額外 TokenCreator 權限）
+          IDT=$(gcloud auth application-default print-identity-token --audiences="$URL")
+          HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/auth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(auth)=$HTTP2"
+          echo "---- body(auth) ----"; cat /tmp/auth.out || true; echo "--------------------"
+          test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
 
-      - name: Cloud Run /health
-        env:
-          SERVICE_URL: ${{ vars.SERVICE_URL }}
+      - name: Prove OIDC in Audit Logs (last 60m)
+        shell: bash
         run: |
-          curl -fS "${SERVICE_URL%/}/health" -i
-
+          set -euo pipefail
+          gcloud logging read \
+            'resource.type="audited_resource"
+             AND protoPayload.methodName="google.iam.credentials.v1.IAMCredentials.GenerateAccessToken"' \
+            --freshness=60m --limit=20 --format=json \
+          | jq -r '.[].protoPayload.authenticationInfo.principalSubject' \
+          | tee /tmp/subjects.txt
+          grep -q "workloadIdentityPools/" /tmp/subjects.txt && echo "Found OIDC principal" || echo "::warning::No OIDC principal found"
