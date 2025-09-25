@@ -79,13 +79,14 @@ jobs:
       PROJECT_ID: esp32cam-472912
       REGION: asia-east1
 
-      # ★ 這四個建議放在 repo → Settings → Secrets and variables → Actions → Variables
+      # 建議這四個由 Repo → Settings → Actions → Variables 提供
       SERVICE_URL: ${{ vars.SERVICE_URL }}           # 例：https://esp32-cam-jim-XXXX.asia-east1.run.app
-      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}       # 例：gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root
-      GCS_INBOX: ${{ vars.GCS_INBOX }}               # 例：gs://esp32cam-472912-faces/new_photos
-      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://esp32cam-472912-vertex-data/faces/personA
+      PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}       # 例：gs://<bucket>/kfp-root
+      GCS_INBOX: ${{ vars.GCS_INBOX }}               # 例：gs://<bucket>/new_photos
+      SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://<bucket>/faces/personA/
 
-      PIPELINE_DEF: pipelines/face_enroll_recognize.json
+      # 若你改用 GCS 路徑，可把變數 PIPELINE_DEF 設為 gs://.../face_enroll_recognize.json
+      PIPELINE_DEF: ${{ vars.PIPELINE_DEF || 'pipelines/face_enroll_recognize.json' }}
 
     steps:
       - name: Checkout
@@ -97,6 +98,13 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
 
+      - name: Who am I (GCP identity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo -n "Active account: "
+          gcloud auth list --filter=status:ACTIVE --format='value(account)'
+
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
@@ -106,47 +114,97 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          command -v jq >/dev/null || sudo apt-get update -y && sudo apt-get install -y jq
+          command -v jq >/dev/null || { sudo apt-get update -y && sudo apt-get install -y jq; }
 
       - name: Sanity check env
         shell: bash
         run: |
           set -euo pipefail
-          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
+          for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI PIPELINE_DEF; do
             if [ -z "${!v:-}" ]; then
               echo "Missing required variable: $v (set repo variable in Settings → Actions → Variables)" >&2
               exit 1
             fi
           done
-          if [ ! -f "${PIPELINE_DEF}" ]; then
-            echo "Missing ${PIPELINE_DEF} in repo" >&2
-            exit 1
+          if echo "${PIPELINE_DEF}" | grep -q '^gs://'; then
+            gsutil ls "${PIPELINE_DEF}" >/dev/null 2>&1 || { echo "Missing ${PIPELINE_DEF} in GCS"; exit 1; }
+          else
+            [ -f "${PIPELINE_DEF}" ] || { echo "Missing ${PIPELINE_DEF} in repo"; exit 1; }
           fi
           echo "SERVICE_URL=${SERVICE_URL}"
           echo "PIPELINE_ROOT=${PIPELINE_ROOT}"
           echo "GCS_INBOX=${GCS_INBOX}"
           echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
+          echo "PIPELINE_DEF=${PIPELINE_DEF}"
 
-      - name: Run Vertex Pipeline (enroll batch)
+      - name: Run Vertex Pipeline (enroll batch) - version compatible
+        id: run_pipeline
         shell: bash
         run: |
           set -euo pipefail
-          gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
-            --region="${REGION}" \
-            --pipeline-definition-file="${PIPELINE_DEF}" \
-            --pipeline-root="${PIPELINE_ROOT}" \
-            --display-name="Enroll Batch via CI" \
-            --labels=ci=codex,stage=enroll \
-            --format="value(name)"
+          JOB_NAME=""
+          if gcloud ai pipeline-jobs --help >/dev/null 2>&1; then
+            JOB_NAME=$(gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll \
+              --format="value(name)")
+          elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
+            JOB_NAME=$(gcloud beta ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll \
+              --format="value(name)")
+          elif gcloud ai pipelines --help >/dev/null 2>&1; then
+            OUT=$(gcloud ai pipelines run \
+              --region="${REGION}" \
+              --pipeline-definition-file="${PIPELINE_DEF}" \
+              --pipeline-root="${PIPELINE_ROOT}" \
+              --display-name="Enroll Batch via CI" \
+              --labels=ci=codex,stage=enroll 2>&1 | tee /tmp/pipelines_run.out)
+            JOB_NAME=$(grep -o 'projects/.*/locations/.*/pipelineJobs/[a-zA-Z0-9_-]*' /tmp/pipelines_run.out | head -n1 || true)
+          else
+            echo "::warning::No Vertex Pipelines command available; skipping pipeline submission."
+          fi
+          echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Submitted: ${JOB_NAME}"
 
       - name: Wait for enroll to finish
+        if: ${{ steps.run_pipeline.outputs.job_name && steps.run_pipeline.outputs.job_name != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
-            --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
-          echo "JOB_ID=$JOB_ID"
-          gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
+          JOB_NAME="${{ steps.run_pipeline.outputs.job_name }}"
+          if gcloud ai pipeline-jobs --help >/dev/null 2>&1; then
+            gcloud ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
+          elif gcloud beta ai pipeline-jobs --help >/dev/null 2>&1; then
+            gcloud beta ai pipeline-jobs wait "${JOB_NAME}" --region="${REGION}"
+          else
+            echo "::notice::No 'pipeline-jobs wait' available; continuing without waiting."
+          fi
+
+      - name: Probe Cloud Run /health
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${SERVICE_URL%/}/health"
+          echo "GET $URL"
+          HTTP=$(curl -sS -o /tmp/health_noauth.out -w "%{http_code}" "$URL" || true)
+          echo "HTTP(no-auth)=$HTTP"
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            cat /tmp/health_noauth.out
+          else
+            echo "---- body(no-auth) ----"; cat /tmp/health_noauth.out || true; echo "-----------------------"
+            IDT=$(gcloud auth print-identity-token --audiences="$URL")
+            HTTP2=$(curl -sS -H "Authorization: Bearer ${IDT}" -o /tmp/health_auth.out -w "%{http_code}" "$URL" || true)
+            echo "HTTP(auth)=$HTTP2"
+            echo "---- body(auth) ----"; cat /tmp/health_auth.out || true; echo "--------------------"
+            test "$HTTP2" -ge 200 -a "$HTTP2" -lt 300
+          fi
 
       - name: Upload one test photo per person (trigger Eventarc)
         shell: bash
@@ -177,13 +235,11 @@ jobs:
             img="/tmp/02_${person}.jpg"
             if gsutil -q stat "${dir}02.jpg"; then
               gsutil cp "${dir}02.jpg" "$img"
-              # 產生 base64（GNU 與 BSD 相容）
               b64=$(base64 -w 0 "$img" 2>/dev/null || base64 "$img" | tr -d '\n')
               payload=$(jq -cn --arg b64 "$b64" --arg person "$person" \
                          '{images: ["data:image/jpeg;base64," + $b64], person: $person}')
               echo "POST /detect_face for ${person}"
-              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" \
-                    -H "Content-Type: application/json" -d "$payload" >/dev/null; then
+              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" -H "Content-Type: application/json" -d "$payload" >/dev/null; then
                 echo "FAIL: ${person}"
                 fails=$((fails+1))
               fi
