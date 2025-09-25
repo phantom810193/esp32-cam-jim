@@ -7,8 +7,8 @@ on:
       - master
       - develop
       - test
-      - feature/**
-  pull_request:
+      - 'feature/**'
+  pull_request: {}
   workflow_dispatch: {}
 
 concurrency:
@@ -31,7 +31,9 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -42,6 +44,7 @@ jobs:
 
       - name: Detect tests
         id: detect
+        shell: bash
         run: |
           if ls -1 test*.py tests/*.py tests/**/*.py */test_*.py 2>/dev/null | head -n1; then
             echo "has_tests=1" >> "$GITHUB_OUTPUT"
@@ -51,10 +54,12 @@ jobs:
 
       - name: Run pytest
         if: steps.detect.outputs.has_tests == '1'
+        shell: bash
         run: pytest --maxfail=1 --disable-warnings -q --ignore=scripts
 
       - name: Skip note (no tests found)
         if: steps.detect.outputs.has_tests != '1'
+        shell: bash
         run: echo "No test files detected; skipping pytest."
 
   pipeline-check:
@@ -70,7 +75,7 @@ jobs:
       REGION: asia-east1
 
       # ★ 這四個建議放在 repo → Settings → Secrets and variables → Actions → Variables
-      SERVICE_URL: ${{ vars.SERVICE_URL }}           # 例：https://esp32-cam-jim-665759721336.asia-east1.run.app
+      SERVICE_URL: ${{ vars.SERVICE_URL }}           # 例：https://esp32-cam-jim-XXXX.asia-east1.run.app
       PIPELINE_ROOT: ${{ vars.PIPELINE_ROOT }}       # 例：gs://esp32cam-472912-vertex-pipelines-asia-east1/kfp-root
       GCS_INBOX: ${{ vars.GCS_INBOX }}               # 例：gs://esp32cam-472912-faces/new_photos
       SAMPLES_ROOT_URI: ${{ vars.SAMPLES_ROOT_URI }} # 例：gs://esp32cam-472912-vertex-data/faces/personA
@@ -93,6 +98,7 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Sanity check env
+        shell: bash
         run: |
           set -e
           for v in SERVICE_URL PIPELINE_ROOT GCS_INBOX SAMPLES_ROOT_URI; do
@@ -109,6 +115,7 @@ jobs:
           echo "SAMPLES_ROOT_URI=${SAMPLES_ROOT_URI}"
 
       - name: Run Vertex Pipeline (enroll batch)
+        shell: bash
         run: |
           gcloud ai pipeline-jobs create "enroll-$(date +%Y%m%d-%H%M%S)" \
             --region="${REGION}" \
@@ -119,6 +126,7 @@ jobs:
             --format="value(name)"
 
       - name: Wait for enroll to finish
+        shell: bash
         run: |
           JOB_ID=$(gcloud ai pipeline-jobs list --region="${REGION}" \
             --filter="labels.ci=codex AND labels.stage=enroll" --format="value(NAME)" | head -n1)
@@ -126,6 +134,7 @@ jobs:
           gcloud ai pipeline-jobs wait "$JOB_ID" --region="${REGION}"
 
       - name: Upload one test photo per person (trigger Eventarc)
+        shell: bash
         run: |
           set -e
           echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
@@ -146,11 +155,17 @@ jobs:
           done
 
       - name: Recognize via API for each person
+        shell: bash
         run: |
           set -e
           fails=0
-          # 先寫入一個臨時 Python 檔，避免 heredoc 解析問題
-          cat > /tmp/post_detect.py <<'PY'
+          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
+            person=$(basename "${dir%/}")
+            if gsutil -q stat "${dir}02.jpg"; then
+              img="/tmp/02_${person}.jpg"
+              gsutil cp "${dir}02.jpg" "$img"
+              echo "POST /detect_face for ${person}"
+              if ! python3 - "$img" "$person" <<'PY'
 import base64, json, os, sys, urllib.request
 img_path = sys.argv[1]
 person = sys.argv[2]
@@ -159,16 +174,10 @@ with open(img_path, "rb") as f:
     b64 = base64.b64encode(f.read()).decode()
 payload = json.dumps({"images": [f"data:image/jpeg;base64,{b64}"], "person": person}).encode()
 req = urllib.request.Request(service_url, data=payload, headers={"Content-Type": "application/json"})
-resp = urllib.request.urlopen(req, timeout=120)
-print(resp.read().decode())
+with urllib.request.urlopen(req, timeout=120) as resp:
+    print(resp.read().decode())
 PY
-          for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
-            person=$(basename "${dir%/}")
-            img="/tmp/02_${person}.jpg"
-            if gsutil -q stat "${dir}02.jpg"; then
-              gsutil cp "${dir}02.jpg" "$img"
-              echo "POST /detect_face for ${person}"
-              if ! python3 /tmp/post_detect.py "$img" "$person"; then
+              then
                 echo "FAIL: ${person}"
                 fails=$((fails+1))
               fi
