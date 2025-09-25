@@ -102,6 +102,12 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      - name: Ensure jq (for JSON building)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || sudo apt-get update -y && sudo apt-get install -y jq
+
       - name: Sanity check env
         shell: bash
         run: |
@@ -147,12 +153,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "Scanning ${SAMPLES_ROOT_URI}/ for subfolders..."
-          # 列出一層子資料夾，例如 .../personA/Alanna/
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
             person=$(basename "${dir%/}")
             src="${dir}01.jpg"
             ts=$(date +%s)
-            # 確保 GCS_INBOX 沒有尾斜線
             inbox="${GCS_INBOX%/}"
             dst="${inbox}/ci_${person}_${ts}.jpg"
             echo "cp ${src} -> ${dst}"
@@ -163,26 +167,26 @@ jobs:
             fi
           done
 
-      - name: Recognize via API for each person
+      - name: Recognize via API for each person (pure bash)
         shell: bash
         run: |
           set -euo pipefail
           fails=0
           for dir in $(gsutil ls "${SAMPLES_ROOT_URI}/"); do
             person=$(basename "${dir%/}")
+            img="/tmp/02_${person}.jpg"
             if gsutil -q stat "${dir}02.jpg"; then
-              img="/tmp/02_${person}.jpg"
               gsutil cp "${dir}02.jpg" "$img"
+              # 產生 base64（GNU 與 BSD 相容）
+              b64=$(base64 -w 0 "$img" 2>/dev/null || base64 "$img" | tr -d '\n')
+              payload=$(jq -cn --arg b64 "$b64" --arg person "$person" \
+                         '{images: ["data:image/jpeg;base64," + $b64], person: $person}')
               echo "POST /detect_face for ${person}"
-              IMG="$img" PERSON="$person" python3 -c "import base64,json,os,urllib.request
-img=os.environ['IMG']; person=os.environ['PERSON']
-service_url=os.environ['SERVICE_URL'].rstrip('/')+'/detect_face'
-with open(img,'rb') as f:
-  b64=base64.b64encode(f.read()).decode()
-payload=json.dumps({'images':['data:image/jpeg;base64,'+b64],'person':person}).encode()
-req=urllib.request.Request(service_url,data=payload,headers={'Content-Type':'application/json'})
-with urllib.request.urlopen(req,timeout=120) as resp:
-  print(resp.read().decode())" || fails=\$((fails+1))
+              if ! curl -fsS -X POST "${SERVICE_URL%/}/detect_face" \
+                    -H "Content-Type: application/json" -d "$payload" >/dev/null; then
+                echo "FAIL: ${person}"
+                fails=$((fails+1))
+              fi
             else
               echo "Skip (no 02.jpg): ${dir}02.jpg"
             fi
